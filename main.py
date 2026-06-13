@@ -1073,6 +1073,22 @@ class MainWindow(QMainWindow):
 # ── 진입점 ───────────────────────────────────────────────────────
 def main():
     app = QApplication(sys.argv)
+
+    # ── 중복 실행 방지 (Single Instance Check) ────────────────────
+    # KeyFlux는 키보드 후킹을 수행하므로, 여러 프로세스가 동시에 실행되면
+    # 한 번의 키 입력에 대해 중복 치환이 발생할 수 있다 (결과가 두 번 나옴).
+    # 이를 방지하기 위해 공유 메모리를 사용하여 단일 인스턴스 실행을 보장한다.
+    shared_mem_key = "KeyFlux_SingleInstance_SharedMem"
+    shared_mem = QSharedMemory(shared_mem_key)
+    
+    # create(1) 시도: 이미 존재하면 False 반환
+    if not shared_mem.create(1):
+        # 이미 메모리가 점유되어 있다면 실행 중인 것.
+        # 비정상 종료 시 메모리가 남을 수 있으므로 attach로 실제 존재 여부 확인.
+        if shared_mem.attach():
+            QMessageBox.warning(None, "KeyFlux", "프로그램이 이미 실행 중입니다.\n트레이 아이콘을 확인하세요.")
+            sys.exit(0)
+
     app.setQuitOnLastWindowClosed(False)
     # 일부 Windows 환경에서 기본 폰트의 pointSize가 -1로 잡혀
     # "QFont::setPointSize: Point size <= 0 (-1)" 경고가 뜨는 것을 방지
