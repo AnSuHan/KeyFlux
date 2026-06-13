@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QDialog, QFormLayout, QComboBox, QMessageBox, QSystemTrayIcon,
     QMenu, QHeaderView, QFrame, QCheckBox, QFileDialog
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QSharedMemory
 from PyQt6.QtGui import QIcon, QColor, QFont, QPixmap, QPainter
 from pynput import keyboard
 from pynput.keyboard import Key, Controller
