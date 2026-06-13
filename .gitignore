@@ -1,0 +1,54 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 가상환경
+.venv/
+venv/
+env/
+ENV/
+
+# 패키징/배포
+*.egg-info/
+.eggs/
+dist/
+build/
+wheels/
+*.egg
+
+# ===== PyInstaller =====
+# build.py 가 --name KeyFlux 로 자동 생성하므로 추적하지 않음
+*.spec
+*.manifest
+
+# ===== KeyFlux 런타임/설정 =====
+# 실행 후 생성되는 사용자 설정
+rules.json
+
+# ===== 테스트/커버리지 =====
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# ===== IDE / 에디터 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ===== OS =====
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# ===== 로그 =====
+*.log
