@@ -18,7 +18,92 @@ from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QSharedMemory
 from PyQt6.QtGui import QIcon, QColor, QFont, QPixmap, QPainter
 from pynput import keyboard
 from pynput.keyboard import Key, Controller
-import pyperclip
+import ctypes
+
+
+# ── 유니코드 직접 주입 (Windows SendInput) ───────────────────────
+# 치환 텍스트를 클립보드+Ctrl+V로 붙여넣지 않고, 글자를 "가상키"가 아닌
+# "유니코드 코드포인트" 자체로 OS 입력 큐에 주입한다(KEYEVENTF_UNICODE).
+#   - IME를 거치지 않으므로 한글 조합형/분리형 문제와 글자 순서 꼬임이 없음
+#   - 클립보드를 건드리지 않으므로 사용자가 복사해둔 내용이 보존됨
+#   - 붙여넣기 단축키(Ctrl+V/Ctrl+Shift+V)에 의존하지 않으므로
+#     메모장·브라우저뿐 아니라 터미널(PowerShell/cmd/Git Bash 등)에서도
+#     "그냥 타이핑한 글자"로 동일하게 들어간다.
+if sys.platform == "win32":
+    from ctypes import wintypes
+
+    _PUL = ctypes.POINTER(ctypes.c_ulong)
+
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+            ("dwExtraInfo", _PUL),
+        ]
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", wintypes.LONG), ("dy", wintypes.LONG),
+            ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD), ("dwExtraInfo", _PUL),
+        ]
+
+    class _HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [
+            ("uMsg", wintypes.DWORD),
+            ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD),
+        ]
+
+    # INPUT 구조체의 union은 가장 큰 멤버(MOUSEINPUT) 크기를 가져야 하므로
+    # ki 외에 mi/hi도 함께 정의해 sizeof(INPUT)가 OS 기대값과 일치하게 한다.
+    class _INPUTUNION(ctypes.Union):
+        _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT), ("hi", _HARDWAREINPUT)]
+
+    class _INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
+
+    _INPUT_KEYBOARD = 1
+    _KEYEVENTF_KEYUP = 0x0002
+    _KEYEVENTF_UNICODE = 0x0004
+
+    # 주의: ctypes.windll.user32.SendInput 은 pynput 등과 공유되는 캐시된
+    # 함수 객체다. 여기에 .argtypes 를 박으면 pynput 의 SendInput 호출이
+    # 타입 불일치로 깨진다(백스페이스/타이핑 전부 실패). 그래서 공유 객체를
+    # 건드리지 않고, 우리 INPUT 구조체에 맞춘 "별도 함수 객체"를 만들어 쓴다.
+    _SendInput = ctypes.WINFUNCTYPE(
+        wintypes.UINT, wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int
+    )(("SendInput", ctypes.windll.user32))
+
+    def send_unicode_string(text: str) -> bool:
+        """text를 KEYEVENTF_UNICODE로 한 번에 주입한다. 성공 시 True.
+        BMP 밖 문자(이모지 등)는 UTF-16 서로게이트 2개로 자동 분할 전송된다.
+        모든 키 이벤트를 단일 SendInput 호출로 보내 글자 순서를 OS가 보장한다."""
+        if not text:
+            return True
+        codes = []
+        for ch in text:
+            b = ch.encode("utf-16-le")
+            for i in range(0, len(b), 2):
+                codes.append(b[i] | (b[i + 1] << 8))
+
+        n = len(codes) * 2  # 글자당 keydown + keyup
+        arr = (_INPUT * n)()
+        idx = 0
+        for code in codes:
+            arr[idx].type = _INPUT_KEYBOARD
+            arr[idx].u.ki = _KEYBDINPUT(0, code, _KEYEVENTF_UNICODE, 0, None)
+            idx += 1
+            arr[idx].type = _INPUT_KEYBOARD
+            arr[idx].u.ki = _KEYBDINPUT(
+                0, code, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP, 0, None)
+            idx += 1
+
+        sent = _SendInput(n, arr, ctypes.sizeof(_INPUT))
+        return sent == n
+else:
+    def send_unicode_string(text: str) -> bool:
+        """비-Windows: 직접 주입 미지원. 호출자가 폴백 타이핑을 쓰도록 False 반환."""
+        return False
 
 # ── 데이터 저장 경로 ──────────────────────────────────────────────
 # 우선순위: 실행파일/스크립트 옆 rules.json  >  홈디렉토리 fallback
@@ -219,17 +304,16 @@ class KeyboardListener(QObject):
     status_changed = pyqtSignal(str)
 
     # ── 입력 주입 타이밍 ─────────────────────────────────────────
-    # 1글자씩 키 입력을 시뮬레이션하면 메모장 등에서 IME/키 처리
-    # 순서가 뒤섞여 "2026-063-1" 같은 글자 순서 오류가 발생할 수 있다.
-    # → 트리거 삭제는 백스페이스(단일 키 반복, 순서 문제 없음)로,
-    #    새 텍스트 입력은 클립보드 + Ctrl+V 붙여넣기로 처리한다.
-    #    (붙여넣기는 한 번에 삽입되므로 글자 순서가 절대 뒤섞이지 않고,
-    #     IME를 거치지 않아 한글 조합형/분리형 문제도 없음)
+    # 트리거 삭제는 백스페이스(단일 키 반복, 순서 문제 없음)로,
+    # 새 텍스트 입력은 유니코드 직접 주입(send_unicode_string)으로 처리한다.
+    #   - 단일 SendInput 호출로 모든 글자를 보내 순서가 절대 뒤섞이지 않음
+    #     (예전 "2026-063-1" 류 순서 꼬임 없음)
+    #   - IME를 거치지 않아 한글 조합형/분리형 문제 없음
+    #   - 클립보드/붙여넣기 단축키에 의존하지 않아 터미널에서도 동일 동작
     _BACKSPACE_DELAY   = 0.008   # 백스페이스 1개당 지연
-    _PRE_PASTE_DELAY   = 0.02    # 백스페이스 완료 후 붙여넣기 시작 전 지연
-    _CLIPBOARD_SETTLE  = 0.03    # 클립보드 변경 후 안정화 대기
-    _PASTE_SETTLE      = 0.08    # Ctrl+V 입력 후 붙여넣기 처리 대기
-    _RESTORE_DELAY     = 0.05    # 원래 클립보드 복원 전 대기
+    _PRE_TYPE_DELAY    = 0.02    # 백스페이스 완료 후 텍스트 주입 시작 전 지연
+    _TYPE_CHAR_DELAY   = 0.003   # 주입 글자 1개당 후크 처리 시간(억제 추정용)
+    _POST_TYPE_DELAY   = 0.03    # 텍스트 주입 후 안정화 대기
 
     # 위 지연들을 합산한 "억제 시간" 보정 마진
     _SUPPRESS_MARGIN = 0.05
@@ -424,10 +508,9 @@ class KeyboardListener(QObject):
         # → 추정이 다소 틀려도 일정 시간 뒤 자동 해제되어
         #   "한 번 꼬이면 영구 복구 안 됨" 문제가 발생하지 않음.
         est = (backspace_count * self._BACKSPACE_DELAY
-               + self._PRE_PASTE_DELAY
-               + self._CLIPBOARD_SETTLE
-               + self._PASTE_SETTLE
-               + self._RESTORE_DELAY
+               + self._PRE_TYPE_DELAY
+               + len(to_type) * self._TYPE_CHAR_DELAY
+               + self._POST_TYPE_DELAY
                + self._SUPPRESS_MARGIN)
         duration = max(self._SUPPRESS_MIN, min(self._SUPPRESS_MAX, est))
         self._suppress_until = time.monotonic() + duration
@@ -466,35 +549,18 @@ class KeyboardListener(QObject):
                 time.sleep(self._BACKSPACE_DELAY)
 
             # 2) 백스페이스가 모두 처리되도록 잠시 대기
-            time.sleep(self._PRE_PASTE_DELAY)
+            time.sleep(self._PRE_TYPE_DELAY)
 
-            # 3) 새 텍스트는 클립보드 + Ctrl+V로 붙여넣기.
-            #    한 글자씩 타이핑하면 메모장 등에서 키/IME 처리 순서가
-            #    뒤섞여 "2026-063-1" 같은 글자 순서 오류가 발생할 수 있는데,
-            #    붙여넣기는 한 번에 삽입되므로 순서가 절대 뒤섞이지 않고
-            #    한글 조합형/분리형 문제도 없음.
-            old_clip = None
-            try:
-                old_clip = pyperclip.paste()
-            except Exception:
-                old_clip = None  # 클립보드 읽기 실패 시 복원 생략
-
-            pyperclip.copy(to_type)
-            time.sleep(self._CLIPBOARD_SETTLE)
-
-            self.controller.press(Key.ctrl)
-            self.controller.press('v')
-            self.controller.release('v')
-            self.controller.release(Key.ctrl)
-            time.sleep(self._PASTE_SETTLE)
-
-            # 4) 원래 클립보드 내용 복원
-            if old_clip is not None:
-                time.sleep(self._RESTORE_DELAY)
-                try:
-                    pyperclip.copy(old_clip)
-                except Exception:
-                    pass
+            # 3) 새 텍스트는 유니코드로 직접 주입한다.
+            #    글자(가상키)가 아니라 유니코드 코드포인트 자체를 단일
+            #    SendInput 호출로 보내므로 순서가 절대 뒤섞이지 않고
+            #    (예전 "2026-063-1" 류 오류 없음), IME를 거치지 않아
+            #    한글 조합형/분리형 문제도 없다. 클립보드도 건드리지 않으며
+            #    붙여넣기 단축키에 의존하지 않아 터미널에서도 동일하게 들어간다.
+            if not send_unicode_string(to_type):
+                # 폴백: 비-Windows이거나 주입 실패 시 pynput 타이핑
+                self.controller.type(to_type)
+            time.sleep(self._POST_TYPE_DELAY)
 
             self.status_changed.emit(f'"{trigger}" → "{resolved}"')
         finally:
