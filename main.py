@@ -100,8 +100,87 @@ if sys.platform == "win32":
 
         sent = _SendInput(n, arr, ctypes.sizeof(_INPUT))
         return sent == n
+
+    # ── 스캔코드 키 이벤트 주입 (터미널 호환) ─────────────────────
+    # KEYEVENTF_UNICODE 로 주입한 글자는 가상키 코드가 0이라, GUI 앱은
+    # 받지만 PowerShell PSReadLine·cmd·readline 같은 "콘솔 줄 편집기"는
+    # 흘려버린다(→ 터미널에서 단축어가 안 먹히는 원인).
+    # 실제 키보드처럼 "스캔코드 키 이벤트"로 보내면 콘솔 줄 편집기도
+    # 정상 인식한다. 단, 스캔코드는 키보드 레이아웃/IME 를 거치므로
+    # 키보드로 칠 수 없는 글자(한글 등)는 보낼 수 없다 → 그런 글자만
+    # 유니코드로 폴백한다(한글은 콘솔에선 제한적이나 GUI 에선 정상).
+    _KEYEVENTF_SCANCODE = 0x0008
+    _VK_SHIFT = 0x10
+    _CTRL_OR_ALT = 0x06  # VkKeyScan 상위바이트의 Ctrl(2)|Alt(4) 비트
+    # 공유 객체 오염 방지: argtypes 를 박지 않고 WINFUNCTYPE 로 별도 함수 생성
+    _VkKeyScanW = ctypes.WINFUNCTYPE(wintypes.SHORT, wintypes.WCHAR)(
+        ("VkKeyScanW", ctypes.windll.user32))
+    _MapVirtualKeyW = ctypes.WINFUNCTYPE(wintypes.UINT, wintypes.UINT, wintypes.UINT)(
+        ("MapVirtualKeyW", ctypes.windll.user32))
+    _SPECIAL_VK = {"\n": 0x0D, "\t": 0x09}  # 줄바꿈/탭은 전용 가상키로
+
+    def _send_key_inputs(events) -> bool:
+        """events: (wVk, wScan, dwFlags) 리스트를 단일 SendInput 으로 전송."""
+        n = len(events)
+        arr = (_INPUT * n)()
+        for i, (vk, sc, fl) in enumerate(events):
+            arr[i].type = _INPUT_KEYBOARD
+            arr[i].u.ki = _KEYBDINPUT(vk, sc, fl, 0, None)
+        return _SendInput(n, arr, ctypes.sizeof(_INPUT)) == n
+
+    def _char_key_events(ch: str):
+        """한 글자를 스캔코드 키 이벤트 리스트로 변환.
+        키보드로 칠 수 없는 글자면 None(→ 호출자가 유니코드로 폴백)."""
+        if ch == "\r":
+            return []
+        if ch in _SPECIAL_VK:
+            vk = _SPECIAL_VK[ch]
+            sc = _MapVirtualKeyW(vk, 0)
+            return [(vk, sc, _KEYEVENTF_SCANCODE),
+                    (vk, sc, _KEYEVENTF_SCANCODE | _KEYEVENTF_KEYUP)]
+        res = _VkKeyScanW(ch)
+        if res == -1:
+            return None
+        vk = res & 0xFF
+        shift_state = (res >> 8) & 0xFF
+        if shift_state & _CTRL_OR_ALT:
+            return None  # AltGr/Ctrl 조합 글자는 유니코드로
+        sc = _MapVirtualKeyW(vk, 0)
+        if sc == 0:
+            return None
+        evs = []
+        sh_sc = _MapVirtualKeyW(_VK_SHIFT, 0)
+        if shift_state & 1:
+            evs.append((_VK_SHIFT, sh_sc, _KEYEVENTF_SCANCODE))
+        evs.append((vk, sc, _KEYEVENTF_SCANCODE))
+        evs.append((vk, sc, _KEYEVENTF_SCANCODE | _KEYEVENTF_KEYUP))
+        if shift_state & 1:
+            evs.append((_VK_SHIFT, sh_sc, _KEYEVENTF_SCANCODE | _KEYEVENTF_KEYUP))
+        return evs
+
+    def send_text(text: str, char_delay: float = 0.01) -> bool:
+        """text 를 글자 단위로 주입. 칠 수 있는 글자는 스캔코드 키로,
+        못 치는 글자는 유니코드로. GUI·터미널 모두에서 동작.
+        콘솔 줄 편집기가 빠른 연속 입력을 흘리지 않도록 글자당 짧게 지연."""
+        if not text:
+            return True
+        ok = True
+        for ch in text:
+            evs = _char_key_events(ch)
+            if evs is None:
+                if not send_unicode_string(ch):
+                    ok = False
+            elif evs:
+                if not _send_key_inputs(evs):
+                    ok = False
+            time.sleep(char_delay)
+        return ok
 else:
     def send_unicode_string(text: str) -> bool:
+        """비-Windows: 직접 주입 미지원. 호출자가 폴백 타이핑을 쓰도록 False 반환."""
+        return False
+
+    def send_text(text: str, char_delay: float = 0.01) -> bool:
         """비-Windows: 직접 주입 미지원. 호출자가 폴백 타이핑을 쓰도록 False 반환."""
         return False
 
@@ -312,7 +391,7 @@ class KeyboardListener(QObject):
     #   - 클립보드/붙여넣기 단축키에 의존하지 않아 터미널에서도 동일 동작
     _BACKSPACE_DELAY   = 0.008   # 백스페이스 1개당 지연
     _PRE_TYPE_DELAY    = 0.02    # 백스페이스 완료 후 텍스트 주입 시작 전 지연
-    _TYPE_CHAR_DELAY   = 0.003   # 주입 글자 1개당 후크 처리 시간(억제 추정용)
+    _TYPE_CHAR_DELAY   = 0.01    # 주입 글자 1개당 지연(send_text char_delay 와 일치)
     _POST_TYPE_DELAY   = 0.03    # 텍스트 주입 후 안정화 대기
 
     # 위 지연들을 합산한 "억제 시간" 보정 마진
@@ -551,13 +630,14 @@ class KeyboardListener(QObject):
             # 2) 백스페이스가 모두 처리되도록 잠시 대기
             time.sleep(self._PRE_TYPE_DELAY)
 
-            # 3) 새 텍스트는 유니코드로 직접 주입한다.
-            #    글자(가상키)가 아니라 유니코드 코드포인트 자체를 단일
-            #    SendInput 호출로 보내므로 순서가 절대 뒤섞이지 않고
-            #    (예전 "2026-063-1" 류 오류 없음), IME를 거치지 않아
-            #    한글 조합형/분리형 문제도 없다. 클립보드도 건드리지 않으며
-            #    붙여넣기 단축키에 의존하지 않아 터미널에서도 동일하게 들어간다.
-            if not send_unicode_string(to_type):
+            # 3) 새 텍스트는 스캔코드 키 이벤트로 직접 주입한다.
+            #    실제 키보드처럼 보내므로 GUI 앱뿐 아니라 PowerShell
+            #    PSReadLine·cmd·readline 같은 콘솔 줄 편집기도 정상 인식한다
+            #    (유니코드 주입은 콘솔 줄 편집기가 흘려버려 터미널에서 실패).
+            #    글자 단위로 순서대로 보내고 짧게 지연해 순서 꼬임을 막는다.
+            #    키보드로 칠 수 없는 글자(한글 등)는 send_text 내부에서
+            #    유니코드로 폴백한다. 클립보드는 건드리지 않는다.
+            if not send_text(to_type):
                 # 폴백: 비-Windows이거나 주입 실패 시 pynput 타이핑
                 self.controller.type(to_type)
             time.sleep(self._POST_TYPE_DELAY)
