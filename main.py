@@ -220,6 +220,38 @@ def save_rules(rules):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(rules, f, ensure_ascii=False, indent=2)
 
+# ── 앱 설정 저장/불러오기 ─────────────────────────────────────────
+# 규칙(rules.json)과 별개로, 동작 옵션(한/영·대소문자 무관 매칭 등)을
+# 규칙 파일 옆 settings 파일에 보관한다.
+SETTINGS_FILE = DATA_FILE.parent / (
+    "keyflux_settings.json" if DATA_FILE.name == "rules.json"
+    else ".keyflux_settings.json"
+)
+
+DEFAULT_SETTINGS = {
+    # 켜면 한/영 입력 상태나 대소문자와 상관없이 트리거가 동작한다.
+    "normalize_mode": True,
+}
+
+def load_settings():
+    settings = dict(DEFAULT_SETTINGS)
+    if SETTINGS_FILE.exists():
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                settings.update(loaded)
+        except Exception:
+            pass
+    return settings
+
+def save_settings(settings):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 # ── 출력 텍스트 처리 (특수 변수 치환) ────────────────────────────
 # {date} {time} {datetime} 는 기본 형식을 그대로 사용하고,
 # {date:형식} 처럼 콜론 뒤에 strftime 형식 코드를 직접 적으면
@@ -378,6 +410,85 @@ def compose_hangul(raw: str) -> str:
     flush()
     return "".join(result)
 
+
+# ── 한/영·대소문자 무관 매칭용 정규화 (두벌식 키 매핑) ───────────
+# 사용자가 트리거를 등록한 입력 모드(한/영)나 대소문자와 상관없이
+# "같은 물리 키"를 누르면 트리거가 동작하도록, 입력과 트리거를 모두
+# "물리 키 시퀀스(영문 소문자)"로 정규화해 비교한다.
+#   - 영문 a~z / A~Z  → 같은 물리 키(소문자)        (대소문자 무관)
+#   - 한글 자모 ㅁ,ㅠ… → 두벌식에서 그 자모가 찍히는 영문 키
+#   - 된소리 ㅃ,ㅉ…    → 평음 키(shift 무시)         (대소문자 무관)
+# 예: 영문 "abc" 와 한글 모드로 같은 키를 친 "ㅁㅠㅊ"(→뮻) 는
+#     둘 다 "abc" 로 정규화되어 서로 매칭된다.
+_DUBEOL_NORMAL = {
+    "q": "ㅂ", "w": "ㅈ", "e": "ㄷ", "r": "ㄱ", "t": "ㅅ",
+    "y": "ㅛ", "u": "ㅕ", "i": "ㅑ", "o": "ㅐ", "p": "ㅔ",
+    "a": "ㅁ", "s": "ㄴ", "d": "ㅇ", "f": "ㄹ", "g": "ㅎ",
+    "h": "ㅗ", "j": "ㅓ", "k": "ㅏ", "l": "ㅣ",
+    "z": "ㅋ", "x": "ㅌ", "c": "ㅊ", "v": "ㅍ",
+    "b": "ㅠ", "n": "ㅜ", "m": "ㅡ",
+}
+# shift 조합으로 입력되는 된소리/이중모음 → 평음/기본 키(소문자, shift 무시)
+_DUBEOL_SHIFT = {
+    "q": "ㅃ", "w": "ㅉ", "e": "ㄸ", "r": "ㄲ", "t": "ㅆ",
+    "o": "ㅒ", "p": "ㅖ",
+}
+# 자모(호환용) → 영문 물리 키
+_JAMO_TO_KEY = {}
+for _k, _v in _DUBEOL_NORMAL.items():
+    _JAMO_TO_KEY[_v] = _k
+for _k, _v in _DUBEOL_SHIFT.items():
+    _JAMO_TO_KEY[_v] = _k  # shift 자모도 같은 (소문자) 키로
+# 겹자모(복합 받침/이중 모음) → 두 개의 물리 키 조합
+_COMPOUND_JAMO_TO_KEY = {
+    "ㄳ": "rt", "ㄵ": "sw", "ㄶ": "sg", "ㄺ": "fr", "ㄻ": "fa",
+    "ㄼ": "fq", "ㄽ": "ft", "ㄾ": "fx", "ㄿ": "fv", "ㅀ": "fg", "ㅄ": "qt",
+    "ㅘ": "hk", "ㅙ": "ho", "ㅚ": "hl", "ㅝ": "nj", "ㅞ": "np",
+    "ㅟ": "nl", "ㅢ": "ml",
+}
+
+
+def _jamo_to_keys(j: str):
+    """자모 한 개를 물리 키 문자열로. 매핑 없으면 None."""
+    if j in _JAMO_TO_KEY:
+        return _JAMO_TO_KEY[j]
+    if j in _COMPOUND_JAMO_TO_KEY:
+        return _COMPOUND_JAMO_TO_KEY[j]
+    return None
+
+
+def _norm_char(ch: str) -> str:
+    """한 글자를 물리 키 시퀀스(영문 소문자)로 정규화.
+    - 완성형 한글 음절은 자모로 분해해 각각 키로 변환
+    - 분리형/현대 자모는 키로 변환
+    - 영문은 소문자(대소문자 무관)
+    - 그 외(숫자·기호·공백 등)는 그대로 통과"""
+    o = ord(ch)
+    if 0xAC00 <= o <= 0xD7A3:  # 완성형 한글 음절
+        code = o - 0xAC00
+        ci, rem = divmod(code, 21 * 28)
+        vi, ji = divmod(rem, 28)
+        out = []
+        for j in (_CHO[ci], _JUNG[vi], _JONG[ji]):
+            if not j:
+                continue
+            keys = _jamo_to_keys(j)
+            out.append(keys if keys is not None else j)
+        return "".join(out)
+    ch2 = _MODERN_TO_COMPAT.get(ch, ch)
+    keys = _jamo_to_keys(ch2)
+    if keys is not None:
+        return keys
+    if ("a" <= ch <= "z") or ("A" <= ch <= "Z"):
+        return ch.lower()
+    return ch
+
+
+def normalize_keyseq(s: str) -> str:
+    """문자열 전체를 물리 키 시퀀스로 정규화."""
+    return "".join(_norm_char(c) for c in s)
+
+
 # ── 키보드 리스너 (백그라운드 스레드) ───────────────────────────
 class KeyboardListener(QObject):
     status_changed = pyqtSignal(str)
@@ -423,18 +534,41 @@ class KeyboardListener(QObject):
         self._special_last_chars = set()
         self._word_last_chars = set()
         self._has_regex = False
+        # 한/영·대소문자 무관 매칭 옵션 (기본 활성화). True면 입력/트리거를
+        # 물리 키 시퀀스로 정규화해 비교한다(normalize_keyseq 참조).
+        self.normalize_mode = True
+        # 트리거 문자열 -> 정규화된 키 시퀀스 캐시 (normalize_mode일 때만 채움)
+        self._norm_triggers = {}
 
     def set_rules(self, rules):
         with self._lock:
             self.rules = [r for r in rules if r.get("enabled", True)]
-            self._special_last_chars = self._collect_last_chars("special")
-            self._word_last_chars = self._collect_last_chars("word")
-            self._has_regex = any(r["type"] == "regex" for r in self.rules)
+            self._rebuild_indexes()
+
+    def set_normalize_mode(self, val: bool):
+        """한/영·대소문자 무관 매칭 옵션을 켜고 끈다. 인덱스를 다시 만든다."""
+        with self._lock:
+            self.normalize_mode = bool(val)
+            self._rebuild_indexes()
+
+    def _rebuild_indexes(self):
+        """빠른 필터 인덱스와 정규화 트리거 캐시를 self.rules 기준으로 재생성.
+        (호출 시 self._lock 을 이미 보유하고 있어야 함)"""
+        self._special_last_chars = self._collect_last_chars("special")
+        self._word_last_chars = self._collect_last_chars("word")
+        self._has_regex = any(r["type"] == "regex" for r in self.rules)
+        self._norm_triggers = {}
+        if self.normalize_mode:
+            for r in self.rules:
+                if r["type"] in ("special", "word") and r["trigger"]:
+                    self._norm_triggers[r["trigger"]] = normalize_keyseq(r["trigger"])
 
     def _collect_last_chars(self, rule_type):
         """트리거의 마지막 글자를 원본(분리형)·조합형 양쪽 다 수집한다.
         예: 트리거가 한글 자모 시퀀스("ㅎㄴㅇ")든 완성형("한녕")이든
-        둘 다 빠른 필터에 걸리도록 한다."""
+        둘 다 빠른 필터에 걸리도록 한다.
+        normalize_mode면 정규화된 키 시퀀스의 마지막 키도 함께 넣어,
+        한/영·대소문자가 달라도 빠른 필터를 통과하게 한다."""
         chars = set()
         for r in self.rules:
             if r["type"] != rule_type or not r["trigger"]:
@@ -444,7 +578,29 @@ class KeyboardListener(QObject):
             comp = compose_hangul(trig)
             if comp:
                 chars.add(comp[-1])
+            if self.normalize_mode:
+                nt = normalize_keyseq(trig)
+                if nt:
+                    chars.add(nt[-1])
         return chars
+
+    def _find_norm_match(self, nt: str):
+        """normalize_mode 매칭: 정규화된 키 시퀀스 nt 가 현재 buffer 끝과
+        일치하면, 소비한 원본(raw) 글자 수 k 를 반환. 아니면 None.
+        끝에서부터 정규화 조각을 모아 정확히 nt 와 같아지는 지점을 찾는다."""
+        if not nt:
+            return None
+        acc = ""
+        k = 0
+        for c in reversed(self.buffer):
+            acc = _norm_char(c) + acc
+            k += 1
+            if len(acc) == len(nt):
+                return k if acc == nt else None
+            if len(acc) > len(nt):
+                # 겹자모가 경계를 가로질러 트리거 길이를 넘어선 경우(드묾)
+                return None
+        return None
 
     def set_active(self, val: bool):
         self.active = val
@@ -494,12 +650,16 @@ class KeyboardListener(QObject):
         with self._lock:
             last_chars = self._special_last_chars
             rules = self.rules[:]
+            norm_on = self.normalize_mode
+            norm_trigs = self._norm_triggers if norm_on else {}
 
         last_raw = self.buffer[-1]
         last_comp = self.composed[-1] if self.composed else ""
+        last_norm = _norm_char(last_raw)[-1:] if norm_on else ""
         # 1) 빠른 필터: 등록된 special 트리거 중 마지막 글자가
-        #    (분리형/조합형 어느 쪽으로든) 일치하지 않으면 즉시 종료
-        if last_raw not in last_chars and last_comp not in last_chars:
+        #    (분리형/조합형/정규화 어느 쪽으로든) 일치하지 않으면 즉시 종료
+        if (last_raw not in last_chars and last_comp not in last_chars
+                and last_norm not in last_chars):
             return
 
         for rule in rules:
@@ -514,21 +674,31 @@ class KeyboardListener(QObject):
             if self.buffer.endswith(trig):
                 self._do_replace(trig, rule["output"], via="raw")
                 return
+            # 정규화(한/영·대소문자 무관) 검사
+            if norm_on:
+                k = self._find_norm_match(norm_trigs.get(trig))
+                if k:
+                    self._do_replace_norm(trig, rule["output"], k)
+                    return
 
     def _check_and_replace(self, append=""):
         with self._lock:
             rules = self.rules[:]
             word_last_chars = self._word_last_chars
             has_regex = self._has_regex
+            norm_on = self.normalize_mode
+            norm_trigs = self._norm_triggers if norm_on else {}
 
         buf = self.buffer
         comp = self.composed
         last_raw = buf[-1] if buf else ""
         last_comp = comp[-1] if comp else ""
+        last_norm = _norm_char(last_raw)[-1:] if (norm_on and last_raw) else ""
 
         # 1) word 트리거: 마지막 글자가 등록된 트리거의 마지막 글자와
-        #    (분리형/조합형 어느 쪽이든) 일치할 때만 정밀 검사
-        if last_raw in word_last_chars or last_comp in word_last_chars:
+        #    (분리형/조합형/정규화 어느 쪽이든) 일치할 때만 정밀 검사
+        if (last_raw in word_last_chars or last_comp in word_last_chars
+                or last_norm in word_last_chars):
             for rule in rules:
                 if rule["type"] != "word":
                     continue
@@ -539,6 +709,11 @@ class KeyboardListener(QObject):
                 if buf.endswith(trig):
                     self._do_replace(trig, rule["output"], extra=append, via="raw")
                     return
+                if norm_on:
+                    k = self._find_norm_match(norm_trigs.get(trig))
+                    if k:
+                        self._do_replace_norm(trig, rule["output"], k, extra=append)
+                        return
 
         # 2) regex 트리거가 하나라도 등록된 경우에만 검사 (조합형 기준)
         if has_regex:
@@ -552,7 +727,17 @@ class KeyboardListener(QObject):
         self.buffer += append
         self.composed = compose_hangul(self.buffer)
 
-    def _do_replace(self, trigger: str, output: str, extra: str = "", via: str = "composed"):
+    def _do_replace_norm(self, trigger: str, output: str, k: int, extra: str = ""):
+        """정규화(한/영·대소문자 무관) 매칭 결과 치환.
+        buffer 의 마지막 k 글자가 트리거에 해당하므로, 화면에 보이는
+        글자 수는 그 부분을 조합한 길이로 계산한다(한글이면 음절 수)."""
+        matched_raw = self.buffer[-k:]
+        visible = len(compose_hangul(matched_raw)) or k
+        self._do_replace(trigger, output, extra=extra, via="norm",
+                         visible_chars=visible)
+
+    def _do_replace(self, trigger: str, output: str, extra: str = "",
+                    via: str = "composed", visible_chars: int = None):
         # 재귀/중첩 호출 방어: 이전 치환의 입력 주입이 아직 진행 중이면 무시
         if self._replacing:
             return
@@ -564,12 +749,17 @@ class KeyboardListener(QObject):
         # 화면에서 지워야 할 "보이는 글자 수"를 계산한다.
         # - via="raw": 트리거 자체가 그대로 입력/표시된 경우 (영문/숫자 등)
         #              → 글자 수 = len(trigger)
+        # - via="norm": 한/영·대소문자 무관 매칭. 실제 화면에 찍힌 글자 수가
+        #              트리거와 다를 수 있어(예: 영문 트리거를 한글 모드로 입력)
+        #              호출자가 계산한 visible_chars 를 그대로 쓴다.
         # - via="composed": 트리거가 한글 자모 조합 결과로 매칭된 경우
         #              → 화면에는 조합된 형태(compose_hangul(trigger))로
         #                보이므로, 그 길이만큼만 백스페이스하면 됨
         #                (한글 1글자 = 백스페이스 1번, 자모 개수와 무관)
         if via == "raw":
             trigger_backspaces = len(trigger)
+        elif visible_chars is not None:
+            trigger_backspaces = visible_chars
         else:
             trigger_backspaces = len(compose_hangul(trigger)) or len(trigger)
 
@@ -782,6 +972,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("KeyFlux")
         self.setMinimumSize(700, 540)
         self.rules = load_rules()
+        self.settings = load_settings()
         self._apply_style()
         self._init_listener()
         self._build_ui()
@@ -927,6 +1118,17 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(export_btn)
         toolbar.addWidget(import_btn)
         toolbar.addStretch()
+
+        # 한/영·대소문자 무관 매칭 옵션 (기본 활성화)
+        self.normalize_chk = QCheckBox("한/영·대소문자 무관")
+        self.normalize_chk.setChecked(
+            bool(self.settings.get("normalize_mode", True)))
+        self.normalize_chk.setToolTip(
+            "켜면 한/영 입력 상태나 대소문자와 상관없이 트리거가 동작합니다.\n"
+            "(예: 영문 모드든 한글 모드든 같은 키를 누르면 변환)")
+        self.normalize_chk.stateChanged.connect(self._toggle_normalize)
+        toolbar.addWidget(self.normalize_chk)
+
         root.addLayout(toolbar)
         root.addSpacing(10)
 
@@ -1164,6 +1366,15 @@ class MainWindow(QMainWindow):
         self.toggle_btn.style().unpolish(self.toggle_btn)
         self.toggle_btn.style().polish(self.toggle_btn)
 
+    # ── 한/영·대소문자 무관 매칭 토글 ────────────────────────────
+    def _toggle_normalize(self, state):
+        val = bool(state)
+        self.settings["normalize_mode"] = val
+        save_settings(self.settings)
+        self.listener.set_normalize_mode(val)
+        self.status_label.setText(
+            "한/영·대소문자 무관 매칭 " + ("켜짐" if val else "꺼짐"))
+
     # ── 트레이 아이콘 ────────────────────────────────────────────
     def _build_tray(self):
         pix = QPixmap(32, 32)
@@ -1198,6 +1409,7 @@ class MainWindow(QMainWindow):
     def _init_listener(self):
         """UI 빌드 전에 listener 객체를 먼저 생성 (rules 참조용)"""
         self.listener = KeyboardListener()
+        self.listener.normalize_mode = bool(self.settings.get("normalize_mode", True))
         self.listener.set_rules(self.rules)
 
     def _connect_listener_signals(self):
