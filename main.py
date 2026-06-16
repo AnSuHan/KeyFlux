@@ -20,6 +20,9 @@ from pynput import keyboard
 from pynput.keyboard import Key, Controller
 import ctypes
 
+# 앱 버전 (SemVer). 릴리스 태그 v<버전> 과 일치시킨다.
+APP_VERSION = "1.1.0"
+
 
 # ── 유니코드 직접 주입 (Windows SendInput) ───────────────────────
 # 치환 텍스트를 클립보드+Ctrl+V로 붙여넣지 않고, 글자를 "가상키"가 아닌
@@ -1508,7 +1511,7 @@ class MainWindow(QMainWindow):
             lambda r: self.show() if r == QSystemTrayIcon.ActivationReason.DoubleClick else None
         )
         self.tray.show()
-        self.tray.setToolTip("KeyFlux - 실행 중")
+        self.tray.setToolTip(f"KeyFlux v{APP_VERSION} - 실행 중")
 
     # ── 리스너 생성/시작 ─────────────────────────────────────────
     def _init_listener(self):
