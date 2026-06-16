@@ -539,6 +539,14 @@ class KeyboardListener(QObject):
         self.normalize_mode = True
         # 트리거 문자열 -> 정규화된 키 시퀀스 캐시 (normalize_mode일 때만 채움)
         self._norm_triggers = {}
+        # ── 접두사 겹침 트리거 보류 상태 ──────────────────────────
+        # 예: special 트리거 "::d" 와 "::dev" 가 둘 다 있으면, "::d"까지
+        # 쳤을 때 곧장 치환해버리면 "::dev"를 영영 칠 수 없다. 그래서
+        # 짧은 트리거가 더 긴 트리거의 접두사이면 즉시 치환하지 않고
+        # "보류(pending)"했다가, 다음 입력이 더 긴 트리거로 갈 수 없게
+        # 되는 순간 그제서야 짧은 트리거를 확정 치환한다.
+        self._pending = None        # (trigger, output, via) 또는 None
+        self._pending_len = 0       # 보류 시점의 buffer 길이
 
     def set_rules(self, rules):
         with self._lock:
@@ -602,12 +610,44 @@ class KeyboardListener(QObject):
                 return None
         return None
 
+    def _holdable_rivals(self, trig):
+        """trig 를 진접두사로 갖는 더 긴 enabled special 트리거 목록.
+        (예: trig="::d" -> ["::dev"]). 비어 있지 않으면 trig 는 보류 대상."""
+        rivals = []
+        for r in self.rules:
+            if r["type"] != "special":
+                continue
+            t2 = r["trigger"]
+            if t2 != trig and len(t2) > len(trig) and t2.startswith(trig):
+                rivals.append(t2)
+        return rivals
+
+    def _still_reaching(self, trig):
+        """보류 중인 trig 의 더 긴 라이벌 트리거에 아직 도달 가능한지.
+        현재 입력(조합형/분리형)이 라이벌의 '진부분 접두사'로 끝나면 True."""
+        for t2 in self._holdable_rivals(trig):
+            # trig 보다 '더 긴' 접두사(= 라이벌 쪽으로 한 글자 이상 진행한 상태)
+            # 가 현재 입력 끝과 일치하면 아직 도달 가능.
+            for j in range(len(t2) - 1, len(trig), -1):
+                p = t2[:j]
+                if self.composed.endswith(p) or self.buffer.endswith(p):
+                    return True
+        return False
+
+    def _fire_special(self, trig, output, via, k=None, extra=""):
+        """매칭된 special 트리거를 실제 치환으로 실행."""
+        if via == "norm":
+            self._do_replace_norm(trig, output, k, extra=extra)
+        else:
+            self._do_replace(trig, output, extra=extra, via=via)
+
     def set_active(self, val: bool):
         self.active = val
         if not val:
             self.buffer = ""
             self.composed = ""
             self._suppress_until = 0.0
+            self._pending = None
 
     def _on_press(self, key):
         if not self.active:
@@ -630,9 +670,13 @@ class KeyboardListener(QObject):
             elif key == Key.backspace:
                 self.buffer = self.buffer[:-1]
                 self.composed = compose_hangul(self.buffer)
+                # 보류 중이던 짧은 트리거가 더 이상 버퍼 끝에 없으면 보류 해제
+                if self._pending and not self.buffer.endswith(self._pending[0]):
+                    self._pending = None
             else:
                 self.buffer = ""
                 self.composed = ""
+                self._pending = None
             return
 
         self.buffer += ch
@@ -646,6 +690,7 @@ class KeyboardListener(QObject):
 
     def _check_immediate(self):
         if not self.buffer:
+            self._pending = None
             return
         with self._lock:
             last_chars = self._special_last_chars
@@ -657,31 +702,71 @@ class KeyboardListener(QObject):
         last_comp = self.composed[-1] if self.composed else ""
         last_norm = _norm_char(last_raw)[-1:] if norm_on else ""
         # 1) 빠른 필터: 등록된 special 트리거 중 마지막 글자가
-        #    (분리형/조합형/정규화 어느 쪽으로든) 일치하지 않으면 즉시 종료
+        #    (분리형/조합형/정규화 어느 쪽으로든) 일치하지 않으면, 완전
+        #    일치는 없다는 뜻. 단 보류(pending) 상태면 해소 여부는 따져야 한다.
         if (last_raw not in last_chars and last_comp not in last_chars
                 and last_norm not in last_chars):
+            self._resolve_pending_if_needed()
             return
 
+        # 2) 버퍼 끝에 완전히 일치하는 special 트리거를 찾는다
+        #    (조합형 → 분리형 → 정규화 순)
         for rule in rules:
             if rule["type"] != "special":
                 continue
             trig = rule["trigger"]
-            # 조합형(완성된 한글 등) 우선 검사
+            matched_via = None
+            matched_k = None
             if self.composed.endswith(trig):
-                self._do_replace(trig, rule["output"], via="composed")
-                return
-            # 분리형(자모 시퀀스 그대로) 검사
-            if self.buffer.endswith(trig):
-                self._do_replace(trig, rule["output"], via="raw")
-                return
-            # 정규화(한/영·대소문자 무관) 검사
-            if norm_on:
+                matched_via = "composed"
+            elif self.buffer.endswith(trig):
+                matched_via = "raw"
+            elif norm_on:
                 k = self._find_norm_match(norm_trigs.get(trig))
                 if k:
-                    self._do_replace_norm(trig, rule["output"], k)
-                    return
+                    matched_via, matched_k = "norm", k
+            if matched_via is None:
+                continue
+
+            # 더 긴 트리거(예: "::dev")가 있으면 즉시 치환하지 않고 보류.
+            # (정규화 매칭은 보류 대상에서 제외 — 교차모드+접두사 겹침은 드묾)
+            if matched_via != "norm" and self._holdable_rivals(trig):
+                self._pending = (trig, rule["output"], matched_via)
+                self._pending_len = len(self.buffer)
+                return
+
+            self._pending = None
+            self._fire_special(trig, rule["output"], matched_via, matched_k)
+            return
+
+        # 완전 일치 트리거 없음 → 보류 해소 여부 판단
+        self._resolve_pending_if_needed()
+
+    def _resolve_pending_if_needed(self):
+        """보류된 짧은 트리거가 있을 때, 더 긴 라이벌에 더는 도달할 수 없으면
+        지금 확정 치환한다. 아직 도달 가능하면 계속 기다린다."""
+        if not self._pending:
+            return
+        p_trig, p_out, p_via = self._pending
+        if self._still_reaching(p_trig):
+            return
+        # 보류 시점 이후 추가로 입력된 글자(extra)는 그대로 다시 찍어준다
+        extra = self.buffer[self._pending_len:]
+        self._pending = None
+        self._fire_special(p_trig, p_out, p_via, extra=extra)
 
     def _check_and_replace(self, append=""):
+        # 보류된 짧은 트리거가 있고, 더 긴 라이벌에 도달할 수 없으면
+        # (스페이스/엔터로 단어가 끝났으므로 대개 도달 불가) 지금 확정한다.
+        # 화면에는 트리거 + 이후 입력 + 방금 누른 스페이스/엔터가 찍혀 있으므로
+        # 그만큼 다시 찍어주도록 extra 에 함께 넘긴다.
+        if self._pending and not self._still_reaching(self._pending[0]):
+            p_trig, p_out, p_via = self._pending
+            extra = self.buffer[self._pending_len:] + append
+            self._pending = None
+            self._fire_special(p_trig, p_out, p_via, extra=extra)
+            return
+
         with self._lock:
             rules = self.rules[:]
             word_last_chars = self._word_last_chars
@@ -898,8 +983,13 @@ class RuleDialog(QDialog):
         btn_row = QHBoxLayout()
         ok_btn     = QPushButton("저장")
         ok_btn.clicked.connect(self.accept)
+        # Enter(Return) 로 저장되도록 "저장" 버튼을 기본 버튼으로 지정.
+        # (QLineEdit 에서 Enter 를 누르면 다이얼로그의 기본 버튼이 눌림)
+        ok_btn.setDefault(True)
+        ok_btn.setAutoDefault(True)
         cancel_btn = QPushButton("취소")
         cancel_btn.setObjectName("secondary")
+        cancel_btn.setAutoDefault(False)
         cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(cancel_btn)
         btn_row.addWidget(ok_btn)
@@ -965,12 +1055,42 @@ class RulesTable(QTableWidget):
             self.drop_callback()
 
 
+# ── 앱 아이콘(파비콘) ─────────────────────────────────────────────
+# 보라색 라운드 사각형 + 흰색 "K". 창(작업표시줄)·트레이·앱 공용.
+# 여러 크기를 담아 작업표시줄/알림영역에서 또렷하게 보이도록 한다.
+def _render_icon_pixmap(size: int) -> QPixmap:
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setBrush(QColor("#7C5CBF"))
+    painter.setPen(Qt.PenStyle.NoPen)
+    radius = max(2, size * 6 // 32)
+    painter.drawRoundedRect(0, 0, size, size, radius, radius)
+    painter.setPen(QColor("#FFFFFF"))
+    icon_font = QFont("Arial")
+    icon_font.setPixelSize(max(8, size * 16 // 32))
+    icon_font.setBold(True)
+    painter.setFont(icon_font)
+    painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "K")
+    painter.end()
+    return pix
+
+
+def make_app_icon() -> QIcon:
+    icon = QIcon()
+    for s in (16, 24, 32, 48, 64, 128, 256):
+        icon.addPixmap(_render_icon_pixmap(s))
+    return icon
+
+
 # ── 메인 윈도우 ──────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("KeyFlux")
         self.setMinimumSize(700, 540)
+        self.setWindowIcon(make_app_icon())  # 창/작업표시줄 아이콘
         self.rules = load_rules()
         self.settings = load_settings()
         self._apply_style()
@@ -1377,22 +1497,7 @@ class MainWindow(QMainWindow):
 
     # ── 트레이 아이콘 ────────────────────────────────────────────
     def _build_tray(self):
-        pix = QPixmap(32, 32)
-        pix.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pix)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setBrush(QColor("#7C5CBF"))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRoundedRect(0, 0, 32, 32, 6, 6)
-        painter.setPen(QColor("#FFFFFF"))
-        icon_font = QFont("Arial")
-        icon_font.setPointSize(16)
-        icon_font.setBold(True)
-        painter.setFont(icon_font)
-        painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "K")
-        painter.end()
-
-        self.tray = QSystemTrayIcon(QIcon(pix), self)
+        self.tray = QSystemTrayIcon(make_app_icon(), self)
         menu = QMenu()
         menu.addAction("열기").triggered.connect(self.show)
         menu.addAction("활성화 토글").triggered.connect(self._toggle_active)
@@ -1432,19 +1537,41 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
 
+    # Windows 작업표시줄이 우리 창을 별도 앱으로 묶고 지정 아이콘을 쓰도록
+    # AppUserModelID 를 명시한다(없으면 python.exe 의 기본 아이콘이 뜸).
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "KeyFlux.App")
+        except Exception:
+            pass
+
+    # 앱 전역 아이콘(파비콘) — 창/작업표시줄/대화상자에 공통 적용
+    app.setWindowIcon(make_app_icon())
+
     # ── 중복 실행 방지 (Single Instance Check) ────────────────────
     # KeyFlux는 키보드 후킹을 수행하므로, 여러 프로세스가 동시에 실행되면
     # 한 번의 키 입력에 대해 중복 치환이 발생할 수 있다 (결과가 두 번 나옴).
     # 이를 방지하기 위해 공유 메모리를 사용하여 단일 인스턴스 실행을 보장한다.
     shared_mem_key = "KeyFlux_SingleInstance_SharedMem"
     shared_mem = QSharedMemory(shared_mem_key)
-    
+
     # create(1) 시도: 이미 존재하면 False 반환
     if not shared_mem.create(1):
         # 이미 메모리가 점유되어 있다면 실행 중인 것.
         # 비정상 종료 시 메모리가 남을 수 있으므로 attach로 실제 존재 여부 확인.
         if shared_mem.attach():
-            QMessageBox.warning(None, "KeyFlux", "프로그램이 이미 실행 중입니다.\n트레이 아이콘을 확인하세요.")
+            # 다이얼로그가 다른 창 뒤로 숨지 않도록 "항상 위" 로 띄우고
+            # 명시적으로 앞으로 끌어온다(show→raise→activate 후 모달 실행).
+            msg = QMessageBox()
+            msg.setWindowTitle("KeyFlux")
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setText("프로그램이 이미 실행 중입니다.\n트레이 아이콘을 확인하세요.")
+            msg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+            msg.show()
+            msg.raise_()
+            msg.activateWindow()
+            msg.exec()
             sys.exit(0)
 
     app.setQuitOnLastWindowClosed(False)
