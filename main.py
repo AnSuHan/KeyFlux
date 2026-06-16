@@ -21,7 +21,7 @@ from pynput.keyboard import Key, Controller
 import ctypes
 
 # 앱 버전 (SemVer). 릴리스 태그 v<버전> 과 일치시킨다.
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 
 # ── 유니코드 직접 주입 (Windows SendInput) ───────────────────────
@@ -178,6 +178,56 @@ if sys.platform == "win32":
                     ok = False
             time.sleep(char_delay)
         return ok
+
+    # ── IME(한/영) 상태 제어 ──────────────────────────────────────
+    # 스캔코드 주입은 "활성 IME"를 거치므로, 한글 입력 모드가 켜져 있으면
+    # 영문 출력(예: "123", "hello")이 한글 자모로 바뀌어 들어간다.
+    # → 출력 주입 직전에 포그라운드 창의 IME 변환 모드를 영문(알파뉴메릭)
+    #   으로 강제했다가, 주입이 끝나면 원래 모드로 복원한다.
+    #   (ImmGetContext 는 프로세스 경계를 못 넘으므로, IME 창에
+    #    WM_IME_CONTROL 메시지를 보내 변환모드를 질의/설정한다 —
+    #    SendMessage 는 대상 스레드로 마샬링되어 크로스프로세스로 동작.)
+    # 공유 함수 객체 오염 방지를 위해 WINFUNCTYPE 로 별도 함수를 만든다.
+    _WM_IME_CONTROL = 0x0283
+    _IMC_GETCONVERSIONMODE = 0x0001
+    _IMC_SETCONVERSIONMODE = 0x0002
+    _IME_CMODE_NATIVE = 0x0001  # 켜져 있으면 한글(네이티브) 입력 모드
+
+    _GetForegroundWindow = ctypes.WINFUNCTYPE(wintypes.HWND)(
+        ("GetForegroundWindow", ctypes.windll.user32))
+    _ImmGetDefaultIMEWnd = ctypes.WINFUNCTYPE(wintypes.HWND, wintypes.HWND)(
+        ("ImmGetDefaultIMEWnd", ctypes.windll.imm32))
+    _SendMessageW = ctypes.WINFUNCTYPE(
+        ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT,
+        wintypes.WPARAM, wintypes.LPARAM)(("SendMessageW", ctypes.windll.user32))
+
+    def ime_force_alphanumeric():
+        """포그라운드 창의 IME가 한글 모드면 영문으로 바꾸고, 복원에 필요한
+        (ime창핸들, 원래모드)를 반환. 한글이 아니거나 IME가 없으면 None."""
+        try:
+            hwnd = _GetForegroundWindow()
+            if not hwnd:
+                return None
+            ime = _ImmGetDefaultIMEWnd(hwnd)
+            if not ime:
+                return None
+            mode = _SendMessageW(ime, _WM_IME_CONTROL, _IMC_GETCONVERSIONMODE, 0)
+            if mode & _IME_CMODE_NATIVE:
+                _SendMessageW(ime, _WM_IME_CONTROL, _IMC_SETCONVERSIONMODE, 0)
+                return (ime, mode)
+        except Exception:
+            pass
+        return None
+
+    def ime_restore(saved):
+        """ime_force_alphanumeric 가 돌려준 상태로 IME 변환모드를 복원."""
+        if not saved:
+            return
+        ime, mode = saved
+        try:
+            _SendMessageW(ime, _WM_IME_CONTROL, _IMC_SETCONVERSIONMODE, mode)
+        except Exception:
+            pass
 else:
     def send_unicode_string(text: str) -> bool:
         """비-Windows: 직접 주입 미지원. 호출자가 폴백 타이핑을 쓰도록 False 반환."""
@@ -186,6 +236,12 @@ else:
     def send_text(text: str, char_delay: float = 0.01) -> bool:
         """비-Windows: 직접 주입 미지원. 호출자가 폴백 타이핑을 쓰도록 False 반환."""
         return False
+
+    def ime_force_alphanumeric():
+        return None
+
+    def ime_restore(saved):
+        return None
 
 # ── 데이터 저장 경로 ──────────────────────────────────────────────
 # 우선순위: 실행파일/스크립트 옆 rules.json  >  홈디렉토리 fallback
@@ -915,9 +971,21 @@ class KeyboardListener(QObject):
             #    글자 단위로 순서대로 보내고 짧게 지연해 순서 꼬임을 막는다.
             #    키보드로 칠 수 없는 글자(한글 등)는 send_text 내부에서
             #    유니코드로 폴백한다. 클립보드는 건드리지 않는다.
-            if not send_text(to_type):
-                # 폴백: 비-Windows이거나 주입 실패 시 pynput 타이핑
-                self.controller.type(to_type)
+            #
+            #    ※ 스캔코드는 활성 IME를 거치므로, 한글 입력 모드가 켜져
+            #      있으면 영문 출력이 한글로 바뀐다. 주입 동안만 IME를
+            #      영문(알파뉴메릭)으로 강제했다가 끝나면 원래대로 복원해,
+            #      출력 값이 한/영 상태와 무관하게 항상 그대로 들어가게 한다.
+            saved_ime = ime_force_alphanumeric()
+            try:
+                if saved_ime:
+                    # IME 모드 전환이 반영될 시간을 짧게 준다
+                    time.sleep(0.01)
+                if not send_text(to_type):
+                    # 폴백: 비-Windows이거나 주입 실패 시 pynput 타이핑
+                    self.controller.type(to_type)
+            finally:
+                ime_restore(saved_ime)
             time.sleep(self._POST_TYPE_DELAY)
 
             self.status_changed.emit(f'"{trigger}" → "{resolved}"')
@@ -1458,6 +1526,8 @@ class MainWindow(QMainWindow):
                 return
             if reply == QMessageBox.StandardButton.Yes:
                 self.rules = loaded
+                QMessageBox.information(
+                    self, "완료", f"{len(loaded)}개 규칙을 불러왔습니다 (대체).")
             else:
                 # 중복 트리거 스킵
                 existing = {r["trigger"] for r in self.rules}
