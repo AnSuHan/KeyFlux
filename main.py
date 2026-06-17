@@ -21,7 +21,7 @@ from pynput.keyboard import Key, Controller
 import ctypes
 
 # 앱 버전 (SemVer). 릴리스 태그 v<버전> 과 일치시킨다.
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.2"
 
 
 # ── 유니코드 직접 주입 (Windows SendInput) ───────────────────────
