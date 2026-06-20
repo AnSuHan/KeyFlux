@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QDialog, QFormLayout, QComboBox, QMessageBox, QSystemTrayIcon,
     QMenu, QHeaderView, QFrame, QCheckBox, QFileDialog
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QSharedMemory
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QIcon, QColor, QFont, QPixmap, QPainter
 from pynput import keyboard
 from pynput.keyboard import Key, Controller
@@ -264,6 +264,23 @@ if sys.platform == "win32":
             return f"hwnd=0x{hwnd:X} class='{cls.value}' title='{title.value}'"
         except Exception:
             return "(fg-info error)"
+
+    # ── 단일 실행 보장 (named mutex) ──────────────────────────────
+    # QSharedMemory 는 강제종료/크래시 시 잠금이 OS 에 남아(leak) 다음 실행을
+    # 영구히 "이미 실행 중"으로 막는 문제가 있다. named mutex 는 소유 프로세스가
+    # 죽으면(크래시 포함) OS 가 자동으로 해제하므로 잠금이 남지 않는다.
+    _CreateMutexW = ctypes.WINFUNCTYPE(
+        wintypes.HANDLE, wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR,
+        use_last_error=True,
+    )(("CreateMutexW", ctypes.windll.kernel32))
+
+    def acquire_single_instance(name="KeyFlux_SingleInstance_Mutex"):
+        """단일 실행 잠금을 시도. 반환: (already_running, handle).
+        handle 는 프로세스가 살아있는 동안 참조를 유지해야 잠금이 유지된다."""
+        ERROR_ALREADY_EXISTS = 183
+        handle = _CreateMutexW(None, False, name)
+        already = bool(handle) and ctypes.get_last_error() == ERROR_ALREADY_EXISTS
+        return already, handle
 else:
     def send_unicode_string(text: str) -> bool:
         """비-Windows: 직접 주입 미지원. 호출자가 폴백 타이핑을 쓰도록 False 반환."""
@@ -281,6 +298,9 @@ else:
 
     def foreground_window_info() -> str:
         return "(non-win32)"
+
+    def acquire_single_instance(name=None):
+        return False, None
 
 # ── 데이터 저장 경로 ──────────────────────────────────────────────
 # 우선순위: 실행파일/스크립트 옆 rules.json  >  홈디렉토리 fallback
@@ -1883,46 +1903,45 @@ def main():
     # ── 중복 실행 방지 (Single Instance Check) ────────────────────
     # KeyFlux는 키보드 후킹을 수행하므로, 여러 프로세스가 동시에 실행되면
     # 한 번의 키 입력에 대해 중복 치환이 발생할 수 있다 (결과가 두 번 나옴).
-    # 이를 방지하기 위해 공유 메모리를 사용하여 단일 인스턴스 실행을 보장한다.
-    shared_mem_key = "KeyFlux_SingleInstance_SharedMem"
-    shared_mem = QSharedMemory(shared_mem_key)
-
-    # create(1) 시도: 이미 존재하면 False 반환
-    if not shared_mem.create(1):
-        # 이미 메모리가 점유되어 있다면 실행 중인 것.
-        # 비정상 종료 시 메모리가 남을 수 있으므로 attach로 실제 존재 여부 확인.
-        if shared_mem.attach():
-            # 다이얼로그가 다른 창 뒤로 숨지 않도록 "항상 위" 로 띄우고
-            # 명시적으로 앞으로 끌어온다(show→raise→activate 후 모달 실행).
-            msg = QMessageBox()
-            msg.setWindowTitle("KeyFlux")
-            msg.setIcon(QMessageBox.Icon.Warning)
-            msg.setText("프로그램이 이미 실행 중입니다.\n트레이 아이콘을 확인하세요.")
-            msg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-            msg.show()
-            msg.raise_()
-            msg.activateWindow()
-            # Windows 의 포그라운드 잠금 때문에 단순 raise/activate 만으로는
-            # 다른 창 뒤로 가려질 수 있다. 포그라운드 스레드에 입력을 잠깐
-            # 붙였다 떼는 방식으로 다이얼로그를 확실히 맨 앞으로 끌어온다.
-            if sys.platform == "win32":
-                try:
-                    user32 = ctypes.windll.user32
-                    kernel32 = ctypes.windll.kernel32
-                    hwnd = int(msg.winId())
-                    user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
-                    fg = user32.GetForegroundWindow()
-                    fg_tid = user32.GetWindowThreadProcessId(fg, None)
-                    cur_tid = kernel32.GetCurrentThreadId()
-                    user32.AttachThreadInput(fg_tid, cur_tid, True)
-                    user32.SetForegroundWindow(hwnd)
-                    user32.BringWindowToTop(hwnd)
-                    user32.SetActiveWindow(hwnd)
-                    user32.AttachThreadInput(fg_tid, cur_tid, False)
-                except Exception:
-                    pass
-            msg.exec()
-            sys.exit(0)
+    # 단일 실행은 named mutex 로 보장한다. (예전 QSharedMemory 방식은 강제종료/
+    # 크래시 시 잠금이 OS 에 남아 다음 실행을 영구히 막는 leak 버그가 있었다.
+    # named mutex 는 프로세스가 죽으면 OS 가 자동 해제하므로 그런 잔류가 없다.)
+    already_running, _single_instance_handle = acquire_single_instance()
+    # 핸들이 GC 로 닫히면 잠금이 풀리므로 앱 객체에 매달아 수명을 앱과 일치시킨다.
+    app._single_instance_handle = _single_instance_handle
+    if already_running:
+        # 진짜로 다른 인스턴스가 살아있는 경우 — 안내 후 종료.
+        # 다이얼로그가 다른 창 뒤로 숨지 않도록 "항상 위" 로 띄우고
+        # 명시적으로 앞으로 끌어온다(show→raise→activate 후 모달 실행).
+        msg = QMessageBox()
+        msg.setWindowTitle("KeyFlux")
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setText("프로그램이 이미 실행 중입니다.\n트레이 아이콘을 확인하세요.")
+        msg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        msg.show()
+        msg.raise_()
+        msg.activateWindow()
+        # Windows 의 포그라운드 잠금 때문에 단순 raise/activate 만으로는
+        # 다른 창 뒤로 가려질 수 있다. 포그라운드 스레드에 입력을 잠깐
+        # 붙였다 떼는 방식으로 다이얼로그를 확실히 맨 앞으로 끌어온다.
+        if sys.platform == "win32":
+            try:
+                user32 = ctypes.windll.user32
+                kernel32 = ctypes.windll.kernel32
+                hwnd = int(msg.winId())
+                user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
+                fg = user32.GetForegroundWindow()
+                fg_tid = user32.GetWindowThreadProcessId(fg, None)
+                cur_tid = kernel32.GetCurrentThreadId()
+                user32.AttachThreadInput(fg_tid, cur_tid, True)
+                user32.SetForegroundWindow(hwnd)
+                user32.BringWindowToTop(hwnd)
+                user32.SetActiveWindow(hwnd)
+                user32.AttachThreadInput(fg_tid, cur_tid, False)
+            except Exception:
+                pass
+        msg.exec()
+        sys.exit(0)
 
     app.setQuitOnLastWindowClosed(False)
     # 일부 Windows 환경에서 기본 폰트의 pointSize가 -1로 잡혀
