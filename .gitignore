@@ -27,6 +27,8 @@ wheels/
 # ===== KeyFlux 런타임/설정 =====
 # 실행 후 생성되는 사용자 설정
 rules.json
+keyflux_settings.json
+.keyflux_settings.json
 
 # ===== 테스트/커버리지 =====
 .pytest_cache/

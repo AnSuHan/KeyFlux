@@ -11,7 +11,9 @@ KeyboardListener 의 실제 치환(_do_replace / _do_replace_norm)은 OS 에 키
 """
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 # 화면 없는 환경에서도 PyQt6 import 가 가능하도록 offscreen 플랫폼 사용
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -85,6 +87,30 @@ class TestResolveOutput(unittest.TestCase):
     def test_invalid_format_kept(self):
         # 잘못된(존재하지 않는) 형식은 원본을 보존
         self.assertEqual(main.resolve_output("{nope}"), "{nope}")
+
+
+# ── ';;' 우선 정렬 ─────────────────────────────────────────────────
+class TestPrioritizeRules(unittest.TestCase):
+    def _r(self, trig):
+        return {"type": "special", "trigger": trig, "output": "x", "enabled": True}
+
+    def test_double_semicolon_floats_to_top(self):
+        rules = [self._r("abc"), self._r(";;d"), self._r("efg"), self._r(";;z")]
+        ordered = main.prioritize_rules(rules)
+        self.assertEqual([r["trigger"] for r in ordered],
+                         [";;d", ";;z", "abc", "efg"])
+
+    def test_stable_within_groups(self):
+        # 같은 그룹(;; 끼리 / 나머지끼리) 내부 상대 순서는 유지
+        rules = [self._r(";;b"), self._r(";;a"), self._r("c"), self._r("b")]
+        ordered = main.prioritize_rules(rules)
+        self.assertEqual([r["trigger"] for r in ordered],
+                         [";;b", ";;a", "c", "b"])
+
+    def test_no_double_semicolon_unchanged(self):
+        rules = [self._r("a"), self._r(";b"), self._r("c")]
+        ordered = main.prioritize_rules(rules)
+        self.assertEqual([r["trigger"] for r in ordered], ["a", ";b", "c"])
 
 
 # ── 리스너 매칭 (가짜 치환으로 발동 내역만 검증) ───────────────────
@@ -221,6 +247,95 @@ class TestPrefixCollision(unittest.TestCase):
             {"type": "special", "trigger": "::d", "output": "DELTA", "enabled": True}])
         h.type_chars("::d")
         self.assertEqual([(e[1],) for e in h.events], [("::d",)])
+
+
+# ── 치환(텍스트 변환) 중 사용자 입력 무시 ─────────────────────────
+class _FakeCharKey:
+    """pynput 의 char 키를 흉내내는 가짜 키 (key.char 만 제공)."""
+    def __init__(self, c):
+        self.char = c
+
+
+class TestIgnoreInputWhileReplacing(unittest.TestCase):
+    def _listener(self):
+        L = main.KeyboardListener()
+        L.set_rules([
+            {"type": "word", "trigger": "abc", "output": "123", "enabled": True}])
+        return L
+
+    def test_char_ignored_while_replacing(self):
+        L = self._listener()
+        L._replacing = True
+        L._on_press(_FakeCharKey("a"))
+        self.assertEqual(L.buffer, "")  # 변환 중 → 입력 무시
+        # 변환이 끝나면(_replacing False) 정상 처리
+        L._replacing = False
+        L._on_press(_FakeCharKey("a"))
+        self.assertEqual(L.buffer, "a")
+
+    def test_space_enter_ignored_while_replacing(self):
+        L = self._listener()
+        L.buffer = "abc"
+        L.composed = "abc"
+        L._replacing = True
+        # 변환 중 스페이스/엔터는 무시 → 버퍼 변화 없음, 치환도 안 일어남
+        L._on_press(main.Key.space)
+        L._on_press(main.Key.enter)
+        self.assertEqual(L.buffer, "abc")
+
+    def test_char_ignored_while_suppressed(self):
+        import time
+        L = self._listener()
+        L._suppress_until = time.monotonic() + 5
+        L._on_press(_FakeCharKey("a"))
+        self.assertEqual(L.buffer, "")
+
+
+# ── 디버그 로깅 on/off ─────────────────────────────────────────────
+class TestDebugLog(unittest.TestCase):
+    def setUp(self):
+        self._old_file = main.DEBUG_LOG_FILE
+        self._old_env = os.environ.pop("KEYFLUX_DEBUG", None)
+        self._tmp = Path(tempfile.gettempdir()) / f"kf_dbg_test_{os.getpid()}.log"
+        if self._tmp.exists():
+            self._tmp.unlink()
+        main.DEBUG_LOG_FILE = self._tmp
+
+    def tearDown(self):
+        main.set_debug(False)
+        main.DEBUG_LOG_FILE = self._old_file
+        if self._old_env is not None:
+            os.environ["KEYFLUX_DEBUG"] = self._old_env
+        if self._tmp.exists():
+            self._tmp.unlink()
+
+    def test_logs_when_enabled(self):
+        main.set_debug(True)
+        main.dbg("hello-debug")
+        self.assertTrue(self._tmp.exists())
+        self.assertIn("hello-debug", self._tmp.read_text(encoding="utf-8"))
+
+    def test_silent_when_disabled(self):
+        main.set_debug(False)
+        main.dbg("should-not-appear")
+        # 꺼져 있으면 파일을 만들지 않거나, 만들어도 내용이 없어야 함
+        if self._tmp.exists():
+            self.assertNotIn("should-not-appear",
+                             self._tmp.read_text(encoding="utf-8"))
+
+
+# ── 진단 헬퍼 스모크 (예외 없이 동작하는지) ───────────────────────
+class TestDiagnosticsSmoke(unittest.TestCase):
+    def test_foreground_window_info_returns_str(self):
+        self.assertIsInstance(main.foreground_window_info(), str)
+
+    def test_is_startup_enabled_returns_bool(self):
+        # 레지스트리를 변경하지 않고 조회만 — 항상 bool 반환
+        self.assertIsInstance(main.is_startup_enabled(), bool)
+
+    def test_startup_target_command_nonempty(self):
+        if sys.platform == "win32":
+            self.assertTrue(main._startup_target_command())
 
 
 if __name__ == "__main__":

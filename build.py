@@ -11,6 +11,7 @@ from pathlib import Path
 HERE = Path(__file__).parent
 RULES_FILE = HERE / "rules.json"
 MAIN_FILE  = HERE / "main.py"
+ICON_FILE  = HERE / "keyflux.ico"  # exe/작업표시줄 아이콘(파비콘)
 
 def run(cmd):
     print("$", " ".join(str(c) for c in cmd))
@@ -31,6 +32,13 @@ def main():
         "--name", "KeyFlux",
         "--clean",
     ]
+
+    # exe 파일/작업표시줄 아이콘 지정 (없으면 generate_icon.py 로 생성 안내)
+    if ICON_FILE.exists():
+        cmd += ["--icon", str(ICON_FILE)]
+    else:
+        print("[경고] keyflux.ico 가 없습니다. 'python generate_icon.py' 로 "
+              "먼저 아이콘을 생성하면 exe 에 아이콘이 적용됩니다.")
 
     if include_rules:
         print("[정보] 빌드 후 dist/rules.json 도 함께 복사합니다.")

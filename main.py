@@ -21,7 +21,7 @@ from pynput.keyboard import Key, Controller
 import ctypes
 
 # 앱 버전 (SemVer). 릴리스 태그 v<버전> 과 일치시킨다.
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 
 # ── 유니코드 직접 주입 (Windows SendInput) ───────────────────────
@@ -74,7 +74,8 @@ if sys.platform == "win32":
     # 타입 불일치로 깨진다(백스페이스/타이핑 전부 실패). 그래서 공유 객체를
     # 건드리지 않고, 우리 INPUT 구조체에 맞춘 "별도 함수 객체"를 만들어 쓴다.
     _SendInput = ctypes.WINFUNCTYPE(
-        wintypes.UINT, wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int
+        wintypes.UINT, wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int,
+        use_last_error=True,
     )(("SendInput", ctypes.windll.user32))
 
     def send_unicode_string(text: str) -> bool:
@@ -102,6 +103,8 @@ if sys.platform == "win32":
             idx += 1
 
         sent = _SendInput(n, arr, ctypes.sizeof(_INPUT))
+        if sent != n:
+            dbg(f"SendInput(unicode) sent={sent}/{n} err={ctypes.get_last_error()}")
         return sent == n
 
     # ── 스캔코드 키 이벤트 주입 (터미널 호환) ─────────────────────
@@ -120,6 +123,10 @@ if sys.platform == "win32":
         ("VkKeyScanW", ctypes.windll.user32))
     _MapVirtualKeyW = ctypes.WINFUNCTYPE(wintypes.UINT, wintypes.UINT, wintypes.UINT)(
         ("MapVirtualKeyW", ctypes.windll.user32))
+    # CapsLock 토글 상태 조회용(공유 객체 오염 방지를 위해 별도 함수 생성)
+    _GetKeyState = ctypes.WINFUNCTYPE(wintypes.SHORT, ctypes.c_int)(
+        ("GetKeyState", ctypes.windll.user32))
+    _VK_CAPITAL = 0x14
     _SPECIAL_VK = {"\n": 0x0D, "\t": 0x09}  # 줄바꿈/탭은 전용 가상키로
 
     def _send_key_inputs(events) -> bool:
@@ -129,7 +136,10 @@ if sys.platform == "win32":
         for i, (vk, sc, fl) in enumerate(events):
             arr[i].type = _INPUT_KEYBOARD
             arr[i].u.ki = _KEYBDINPUT(vk, sc, fl, 0, None)
-        return _SendInput(n, arr, ctypes.sizeof(_INPUT)) == n
+        sent = _SendInput(n, arr, ctypes.sizeof(_INPUT))
+        if sent != n:
+            dbg(f"SendInput(scancode) sent={sent}/{n} err={ctypes.get_last_error()}")
+        return sent == n
 
     def _char_key_events(ch: str):
         """한 글자를 스캔코드 키 이벤트 리스트로 변환.
@@ -148,6 +158,11 @@ if sys.platform == "win32":
         shift_state = (res >> 8) & 0xFF
         if shift_state & _CTRL_OR_ALT:
             return None  # AltGr/Ctrl 조합 글자는 유니코드로
+        # CapsLock 보정: ASCII 알파벳은 CapsLock 토글이 켜져 있으면 실제
+        # 들어가는 대소문자가 뒤집힌다. 저장된 글자 그대로(저장된 대소문자로)
+        # 주입되도록, CapsLock 이 켜져 있을 때 알파벳의 shift 요구를 반전한다.
+        if ch.isascii() and ch.isalpha() and (_GetKeyState(_VK_CAPITAL) & 0x0001):
+            shift_state ^= 1
         sc = _MapVirtualKeyW(vk, 0)
         if sc == 0:
             return None
@@ -195,6 +210,12 @@ if sys.platform == "win32":
 
     _GetForegroundWindow = ctypes.WINFUNCTYPE(wintypes.HWND)(
         ("GetForegroundWindow", ctypes.windll.user32))
+    _GetClassNameW = ctypes.WINFUNCTYPE(
+        ctypes.c_int, wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)(
+        ("GetClassNameW", ctypes.windll.user32))
+    _GetWindowTextW = ctypes.WINFUNCTYPE(
+        ctypes.c_int, wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)(
+        ("GetWindowTextW", ctypes.windll.user32))
     _ImmGetDefaultIMEWnd = ctypes.WINFUNCTYPE(wintypes.HWND, wintypes.HWND)(
         ("ImmGetDefaultIMEWnd", ctypes.windll.imm32))
     _SendMessageW = ctypes.WINFUNCTYPE(
@@ -228,6 +249,21 @@ if sys.platform == "win32":
             _SendMessageW(ime, _WM_IME_CONTROL, _IMC_SETCONVERSIONMODE, mode)
         except Exception:
             pass
+
+    def foreground_window_info() -> str:
+        """현재 포그라운드 창의 클래스/제목 (디버그 진단용).
+        터미널 종류 식별과 '주입 대상 창'이 무엇인지 확인하는 데 쓴다."""
+        try:
+            hwnd = _GetForegroundWindow()
+            if not hwnd:
+                return "(no foreground)"
+            cls = ctypes.create_unicode_buffer(256)
+            _GetClassNameW(hwnd, cls, 256)
+            title = ctypes.create_unicode_buffer(256)
+            _GetWindowTextW(hwnd, title, 256)
+            return f"hwnd=0x{hwnd:X} class='{cls.value}' title='{title.value}'"
+        except Exception:
+            return "(fg-info error)"
 else:
     def send_unicode_string(text: str) -> bool:
         """비-Windows: 직접 주입 미지원. 호출자가 폴백 타이핑을 쓰도록 False 반환."""
@@ -242,6 +278,9 @@ else:
 
     def ime_restore(saved):
         return None
+
+    def foreground_window_info() -> str:
+        return "(non-win32)"
 
 # ── 데이터 저장 경로 ──────────────────────────────────────────────
 # 우선순위: 실행파일/스크립트 옆 rules.json  >  홈디렉토리 fallback
@@ -279,6 +318,13 @@ def save_rules(rules):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(rules, f, ensure_ascii=False, indent=2)
 
+def prioritize_rules(rules):
+    """트리거가 ';;' 로 시작하는 규칙을 항상 목록 맨 위(1순위)로 끌어올린
+    새 리스트를 반환한다. 같은 그룹 내 상대 순서는 유지(안정 정렬)."""
+    return sorted(
+        rules,
+        key=lambda r: 0 if r.get("trigger", "").startswith(";;") else 1)
+
 # ── 앱 설정 저장/불러오기 ─────────────────────────────────────────
 # 규칙(rules.json)과 별개로, 동작 옵션(한/영·대소문자 무관 매칭 등)을
 # 규칙 파일 옆 settings 파일에 보관한다.
@@ -290,6 +336,10 @@ SETTINGS_FILE = DATA_FILE.parent / (
 DEFAULT_SETTINGS = {
     # 켜면 한/영 입력 상태나 대소문자와 상관없이 트리거가 동작한다.
     "normalize_mode": True,
+    # 켜면 변환/트레이 안내를 윈도우 알림(트레이 풍선)으로 띄운다.
+    "notifications_enabled": True,
+    # 켜면 키 감지·치환·주입 과정을 keyflux_debug.log 에 기록한다(진단용).
+    "debug_log": False,
 }
 
 def load_settings():
@@ -308,6 +358,79 @@ def save_settings(settings):
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(settings, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+# ── 시작 프로그램 등록 (Windows 시작 시 자동 실행) ─────────────────
+# HKCU\...\Run 에 실행 명령을 등록/해제해, 로그인 시 KeyFlux 가 자동
+# 실행되게 한다. (관리자 권한이 필요 없는 사용자 단위 등록)
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_RUN_VALUE = "KeyFlux"
+
+def _startup_target_command() -> str:
+    """시작 시 실행할 명령 문자열.
+    - frozen(PyInstaller exe): exe 경로 자체
+    - 스크립트 실행: pythonw(콘솔 없는 인터프리터) + main.py 경로"""
+    if getattr(sys, "frozen", False):
+        return f'"{Path(sys.executable)}"'
+    pyw = Path(sys.executable).with_name("pythonw.exe")
+    launcher = pyw if pyw.exists() else Path(sys.executable)
+    return f'"{launcher}" "{Path(__file__).resolve()}"'
+
+def is_startup_enabled() -> bool:
+    """현재 시작 프로그램에 등록되어 있는지 (레지스트리 실제 상태)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
+            val, _ = winreg.QueryValueEx(key, _RUN_VALUE)
+            return bool(val)
+    except OSError:
+        return False
+
+def set_startup(enabled: bool) -> bool:
+    """시작 프로그램 등록/해제. 성공 시 True."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, _RUN_VALUE, 0, winreg.REG_SZ,
+                                  _startup_target_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, _RUN_VALUE)
+                except FileNotFoundError:
+                    pass
+        return True
+    except OSError:
+        return False
+
+# ── 디버그 로깅 ──────────────────────────────────────────────────
+# "특정 터미널에서 단축어가 안 되는" 문제를, '감지가 됐는지 / 주입이 갔는지'
+# 로 판별하기 위한 진단용 로그. 환경변수 KEYFLUX_DEBUG=1 또는 설정의
+# "debug_log": true 일 때, 키 감지·매칭·주입(SendInput 성공 여부 포함)을
+# 시각과 함께 rules 파일 옆 keyflux_debug.log 에 남긴다.
+DEBUG_LOG_FILE = DATA_FILE.parent / "keyflux_debug.log"
+_debug_enabled = bool(os.environ.get("KEYFLUX_DEBUG"))
+_debug_lock = threading.Lock()
+
+def set_debug(enabled: bool):
+    """디버그 로깅 on/off. 환경변수 KEYFLUX_DEBUG 가 설정돼 있으면 항상 켜짐."""
+    global _debug_enabled
+    _debug_enabled = bool(enabled) or bool(os.environ.get("KEYFLUX_DEBUG"))
+
+def dbg(msg: str):
+    if not _debug_enabled:
+        return
+    try:
+        ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        with _debug_lock:
+            with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"{ts} {msg}\n")
     except Exception:
         pass
 
@@ -712,9 +835,13 @@ class KeyboardListener(QObject):
         if not self.active:
             return
 
-        # 1) 우리가 controller로 직접 보낸(자가 입력) 이벤트는 무시
-        #    -> 시간 기반이므로, 추정이 틀려도 시간이 지나면 자동 해제됨
-        if time.monotonic() < self._suppress_until:
+        # 1) 우리가 controller로 직접 보낸(자가 입력) 이벤트는 무시.
+        #    또한 치환(텍스트 변환)이 진행되는 "동안"의 사용자 입력도 무시한다
+        #    → 변환 중 사용자가 띄어쓰기/엔터를 눌러도 결과가 깨지지 않게.
+        #    (_replacing 은 주입이 실제 끝날 때까지 True 이므로, 추정 시간보다
+        #     주입이 오래 걸리는 느린 터미널에서도 안전)
+        #    -> 시간 기반 + 플래그 병행이라 추정이 틀려도 자동 복구됨.
+        if time.monotonic() < self._suppress_until or self._replacing:
             return
 
         try:
@@ -725,6 +852,8 @@ class KeyboardListener(QObject):
         if ch is None:
             # 특수키 (Ctrl, Alt, F1~F12, 한자/한영키 등) → char가 None
             if key in (Key.space, Key.enter):
+                dbg(f"key {'SPACE' if key == Key.space else 'ENTER'} "
+                    f"buf={self.buffer[-24:]!r}")
                 self._check_and_replace(append=" " if key == Key.space else "\n")
             elif key == Key.backspace:
                 self.buffer = self.buffer[:-1]
@@ -745,6 +874,7 @@ class KeyboardListener(QObject):
         # 매번 전체를 재조합하므로, 받침이 다음 음절 초성으로 옮겨가는
         # 재구성("간"+ㅏ → "가"+"나") 같은 경우도 항상 정확하다.
         self.composed = compose_hangul(self.buffer)
+        dbg(f"key {ch!r} buf={self.buffer[-24:]!r} comp={self.composed[-24:]!r}")
         self._check_immediate()
 
     def _check_immediate(self):
@@ -884,6 +1014,7 @@ class KeyboardListener(QObject):
                     via: str = "composed", visible_chars: int = None):
         # 재귀/중첩 호출 방어: 이전 치환의 입력 주입이 아직 진행 중이면 무시
         if self._replacing:
+            dbg(f"REPLACE skipped (busy) trig={trigger!r}")
             return
         self._replacing = True
 
@@ -941,6 +1072,9 @@ class KeyboardListener(QObject):
             self.buffer = to_type
         self.composed = compose_hangul(self.buffer)
 
+        dbg(f"REPLACE trig={trigger!r} via={via} bs={backspace_count} "
+            f"to_type={to_type!r} fg={foreground_window_info()}")
+
         # 실제 키 입력 주입은 백그라운드 스레드에서 처리한다.
         # 1) 후킹 콜백을 즉시 반환시켜 다른 키 입력을 막지(블로킹) 않음
         # 2) 백스페이스 → (지연) → 붙여넣기 순서로 보내 race condition 방지
@@ -956,6 +1090,8 @@ class KeyboardListener(QObject):
             #    "한 글자씩" 보내고, 대상 앱이 처리할 시간을 준다.
             #    (단일 키의 반복이라 순서가 뒤섞일 일이 없음.
             #     한글 음절도 백스페이스 1번에 1글자씩 지워짐)
+            dbg(f"inject start bs={backspace_count} to_type={to_type!r} "
+                f"fg={foreground_window_info()}")
             for _ in range(backspace_count):
                 self.controller.press(Key.backspace)
                 self.controller.release(Key.backspace)
@@ -963,6 +1099,7 @@ class KeyboardListener(QObject):
 
             # 2) 백스페이스가 모두 처리되도록 잠시 대기
             time.sleep(self._PRE_TYPE_DELAY)
+            dbg("backspaces sent")
 
             # 3) 새 텍스트는 스캔코드 키 이벤트로 직접 주입한다.
             #    실제 키보드처럼 보내므로 GUI 앱뿐 아니라 PowerShell
@@ -977,16 +1114,21 @@ class KeyboardListener(QObject):
             #      영문(알파뉴메릭)으로 강제했다가 끝나면 원래대로 복원해,
             #      출력 값이 한/영 상태와 무관하게 항상 그대로 들어가게 한다.
             saved_ime = ime_force_alphanumeric()
+            dbg(f"ime_forced={bool(saved_ime)}")
             try:
                 if saved_ime:
                     # IME 모드 전환이 반영될 시간을 짧게 준다
                     time.sleep(0.01)
-                if not send_text(to_type):
+                ok = send_text(to_type)
+                dbg(f"send_text ok={ok}")
+                if not ok:
                     # 폴백: 비-Windows이거나 주입 실패 시 pynput 타이핑
                     self.controller.type(to_type)
+                    dbg("fallback pynput type used")
             finally:
                 ime_restore(saved_ime)
             time.sleep(self._POST_TYPE_DELAY)
+            dbg(f"inject done trig={trigger!r}")
 
             self.status_changed.emit(f'"{trigger}" → "{resolved}"')
         finally:
@@ -996,6 +1138,8 @@ class KeyboardListener(QObject):
         # suppress=False (기본값) : 모든 키 이벤트를 가로채거나 차단하지 않고
         # 그대로 OS/대상 앱에 전달한다. 이 리스너는 "관찰"만 하며,
         # 등록된 트리거가 완성됐을 때만 백스페이스+재입력으로 치환한다.
+        dbg(f"listener started normalize_mode={self.normalize_mode} "
+            f"rules={len(self.rules)}")
         self._listener = keyboard.Listener(on_press=self._on_press, suppress=False)
         self._listener.start()
 
@@ -1119,6 +1263,9 @@ class RulesTable(QTableWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.drop_callback = None
+        # 픽셀 단위 스크롤로 휠/드래그가 부드럽게 움직이게 한다(동작은 동일).
+        self.setVerticalScrollMode(
+            QTableWidget.ScrollMode.ScrollPerPixel)
 
     def dropEvent(self, event):
         super().dropEvent(event)
@@ -1164,6 +1311,7 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(make_app_icon())  # 창/작업표시줄 아이콘
         self.rules = load_rules()
         self.settings = load_settings()
+        set_debug(self.settings.get("debug_log", False))
         self._apply_style()
         self._init_listener()
         self._build_ui()
@@ -1233,6 +1381,34 @@ class MainWindow(QMainWindow):
                 width: 16px; height: 16px; border-radius: 4px;
                 border: 1px solid #444; background: #141620; }
             QCheckBox::indicator:checked { background: #7C5CBF; border-color: #7C5CBF; }
+
+            /* 스크롤바: 다크 테마에 맞춘 또렷하고 직관적인 모양.
+               (기본 OS 스크롤바가 어두운 UI 와 안 어울려 잘 안 보이던 문제 개선)
+               - 트랙은 은은하게, 손잡이(핸들)는 보라 계열로 명확히 보이게
+               - 위/아래 화살표 버튼은 제거해 깔끔하게 */
+            QScrollBar:vertical {
+                background: #141620; width: 12px; margin: 2px;
+                border: none; border-radius: 6px; }
+            QScrollBar::handle:vertical {
+                background: #3A3358; min-height: 32px; border-radius: 6px; }
+            QScrollBar::handle:vertical:hover   { background: #7C5CBF; }
+            QScrollBar::handle:vertical:pressed { background: #9370DB; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px; background: none; border: none; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: none; }
+
+            QScrollBar:horizontal {
+                background: #141620; height: 12px; margin: 2px;
+                border: none; border-radius: 6px; }
+            QScrollBar::handle:horizontal {
+                background: #3A3358; min-width: 32px; border-radius: 6px; }
+            QScrollBar::handle:horizontal:hover   { background: #7C5CBF; }
+            QScrollBar::handle:horizontal:pressed { background: #9370DB; }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px; background: none; border: none; }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: none; }
         """)
 
     # ── UI 구성 ──────────────────────────────────────────────────
@@ -1320,6 +1496,33 @@ class MainWindow(QMainWindow):
         self.normalize_chk.stateChanged.connect(self._toggle_normalize)
         toolbar.addWidget(self.normalize_chk)
 
+        # 윈도우 알림(트레이 풍선) 출력 여부 (기본 켜짐)
+        self.notify_chk = QCheckBox("알림 표시")
+        self.notify_chk.setChecked(
+            bool(self.settings.get("notifications_enabled", True)))
+        self.notify_chk.setToolTip(
+            "켜면 변환 결과와 트레이 안내를 윈도우 알림(풍선)으로 표시합니다.")
+        self.notify_chk.stateChanged.connect(self._toggle_notifications)
+        toolbar.addWidget(self.notify_chk)
+
+        # 시작 시 자동 실행 (Windows 시작 프로그램 등록)
+        self.startup_chk = QCheckBox("시작 시 자동 실행")
+        self.startup_chk.setChecked(is_startup_enabled())
+        self.startup_chk.setEnabled(sys.platform == "win32")
+        self.startup_chk.setToolTip(
+            "켜면 Windows 로그인 시 KeyFlux 가 자동으로 실행됩니다.")
+        self.startup_chk.stateChanged.connect(self._toggle_startup)
+        toolbar.addWidget(self.startup_chk)
+
+        # 디버그 로그 (진단용). 켜면 keyflux_debug.log 에 감지/주입 과정 기록
+        self.debug_chk = QCheckBox("디버그 로그")
+        self.debug_chk.setChecked(bool(self.settings.get("debug_log", False)))
+        self.debug_chk.setToolTip(
+            "켜면 키 감지·치환·주입 과정을 파일로 기록합니다.\n"
+            f"기록 위치: {DEBUG_LOG_FILE}")
+        self.debug_chk.stateChanged.connect(self._toggle_debug)
+        toolbar.addWidget(self.debug_chk)
+
         root.addLayout(toolbar)
         root.addSpacing(10)
 
@@ -1372,6 +1575,9 @@ class MainWindow(QMainWindow):
 
     # ── 테이블 갱신 ──────────────────────────────────────────────
     def _refresh_table(self):
+        # ';;' 로 시작하는 규칙을 항상 맨 위로 끌어올린 뒤 그린다.
+        if self._apply_priority_order():
+            save_rules(self.rules)
         self.table.setRowCount(0)
         type_colors = {"word": "#7C5CBF", "special": "#2A8FBF", "regex": "#BF7C2A"}
         for i, rule in enumerate(self.rules):
@@ -1485,8 +1691,11 @@ class MainWindow(QMainWindow):
 
     # ── 설정 내보내기 / 불러오기 ─────────────────────────────────
     def _export_rules(self):
+        # 파일명에 타임스탬프를 넣어 매 추출본이 덮어쓰이지 않게 한다.
+        default_name = datetime.datetime.now().strftime(
+            "KeyFlux_rules_%Y%m%d_%H%M%S.json")
         path, _ = QFileDialog.getSaveFileName(
-            self, "규칙 내보내기", "textshift_rules.json",
+            self, "규칙 내보내기", default_name,
             "JSON 파일 (*.json)"
         )
         if not path:
@@ -1568,6 +1777,55 @@ class MainWindow(QMainWindow):
         self.status_label.setText(
             "한/영·대소문자 무관 매칭 " + ("켜짐" if val else "꺼짐"))
 
+    # ── 윈도우 알림 표시 토글 ────────────────────────────────────
+    def _toggle_notifications(self, state):
+        val = bool(state)
+        self.settings["notifications_enabled"] = val
+        save_settings(self.settings)
+        self.status_label.setText("윈도우 알림 " + ("켜짐" if val else "꺼짐"))
+
+    def _notify(self, title, msg, icon=QSystemTrayIcon.MessageIcon.NoIcon,
+                ms=1500):
+        """설정에 따라 트레이 풍선 알림을 띄운다(꺼져 있으면 무시)."""
+        if self.settings.get("notifications_enabled", True):
+            self.tray.showMessage(title, msg, icon, ms)
+
+    # ── 디버그 로그 토글 ─────────────────────────────────────────
+    def _toggle_debug(self, state):
+        val = bool(state)
+        self.settings["debug_log"] = val
+        save_settings(self.settings)
+        set_debug(val)
+        if val:
+            dbg("==== debug logging enabled ====")
+            self.status_label.setText(f"디버그 로그 기록: {DEBUG_LOG_FILE}")
+        else:
+            self.status_label.setText("디버그 로그 꺼짐")
+
+    # ── 시작 시 자동 실행 토글 ───────────────────────────────────
+    def _toggle_startup(self, state):
+        val = bool(state)
+        if set_startup(val):
+            self.status_label.setText(
+                "시작 시 자동 실행 " + ("등록됨" if val else "해제됨"))
+        else:
+            # 실패 시 체크 상태를 실제 레지스트리 상태로 되돌린다
+            self.status_label.setText("시작 프로그램 설정에 실패했습니다.")
+            self.startup_chk.blockSignals(True)
+            self.startup_chk.setChecked(is_startup_enabled())
+            self.startup_chk.blockSignals(False)
+
+    # ── ';;' 우선 정렬 ───────────────────────────────────────────
+    def _apply_priority_order(self) -> bool:
+        """트리거가 ';;' 로 시작하는 규칙을 항상 목록 맨 위(1순위)로
+        끌어올린다. 같은 그룹 내 상대 순서는 유지(안정 정렬).
+        순서가 바뀌었으면 True 를 반환한다."""
+        ordered = prioritize_rules(self.rules)
+        if ordered != self.rules:
+            self.rules = ordered
+            return True
+        return False
+
     # ── 트레이 아이콘 ────────────────────────────────────────────
     def _build_tray(self):
         self.tray = QSystemTrayIcon(make_app_icon(), self)
@@ -1597,13 +1855,13 @@ class MainWindow(QMainWindow):
 
     def _on_status(self, msg):
         self.status_label.setText(f"변환됨: {msg}")
-        self.tray.showMessage("KeyFlux", msg, QSystemTrayIcon.MessageIcon.NoIcon, 1500)
+        self._notify("KeyFlux", msg, QSystemTrayIcon.MessageIcon.NoIcon, 1500)
 
     def closeEvent(self, event):
         event.ignore()
         self.hide()
-        self.tray.showMessage("KeyFlux", "트레이에서 계속 실행 중입니다.",
-                              QSystemTrayIcon.MessageIcon.Information, 2000)
+        self._notify("KeyFlux", "트레이에서 계속 실행 중입니다.",
+                     QSystemTrayIcon.MessageIcon.Information, 2000)
 
 
 # ── 진입점 ───────────────────────────────────────────────────────
@@ -1644,6 +1902,25 @@ def main():
             msg.show()
             msg.raise_()
             msg.activateWindow()
+            # Windows 의 포그라운드 잠금 때문에 단순 raise/activate 만으로는
+            # 다른 창 뒤로 가려질 수 있다. 포그라운드 스레드에 입력을 잠깐
+            # 붙였다 떼는 방식으로 다이얼로그를 확실히 맨 앞으로 끌어온다.
+            if sys.platform == "win32":
+                try:
+                    user32 = ctypes.windll.user32
+                    kernel32 = ctypes.windll.kernel32
+                    hwnd = int(msg.winId())
+                    user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
+                    fg = user32.GetForegroundWindow()
+                    fg_tid = user32.GetWindowThreadProcessId(fg, None)
+                    cur_tid = kernel32.GetCurrentThreadId()
+                    user32.AttachThreadInput(fg_tid, cur_tid, True)
+                    user32.SetForegroundWindow(hwnd)
+                    user32.BringWindowToTop(hwnd)
+                    user32.SetActiveWindow(hwnd)
+                    user32.AttachThreadInput(fg_tid, cur_tid, False)
+                except Exception:
+                    pass
             msg.exec()
             sys.exit(0)
 
