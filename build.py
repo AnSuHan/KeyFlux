@@ -3,6 +3,8 @@ KeyFlux 빌드 스크립트
   python build.py             -- 기본 빌드 (rules.json 없으면 번들 안 함)
   python build.py --with-rules -- 현재 rules.json 을 exe 에 포함
 """
+import os
+import re
 import sys
 import subprocess
 import shutil
@@ -12,6 +14,18 @@ HERE = Path(__file__).parent
 RULES_FILE = HERE / "rules.json"
 MAIN_FILE  = HERE / "main.py"
 ICON_FILE  = HERE / "keyflux.ico"  # exe/작업표시줄 아이콘(파비콘)
+
+
+def _app_version() -> str:
+    """main.py 의 APP_VERSION 을 읽어온다(=릴리스 태그/파일명 버전)."""
+    text = MAIN_FILE.read_text(encoding="utf-8")
+    m = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
+    return m.group(1) if m else "0.0.0"
+
+
+# GitHub 배포 시 실행파일명에 버전을 포함한다(예: KeyFlux_v1.0.3.exe).
+APP_VERSION = _app_version()
+APP_NAME = f"KeyFlux_v{APP_VERSION}"
 
 def run(cmd):
     print("$", " ".join(str(c) for c in cmd))
@@ -29,13 +43,16 @@ def main():
         sys.executable, "-m", "PyInstaller",
         "--onefile",
         "--windowed",           # 콘솔 창 숨김 (Windows)
-        "--name", "KeyFlux",
+        "--name", APP_NAME,     # 버전 포함 파일명 (KeyFlux_v1.0.3)
         "--clean",
     ]
 
     # exe 파일/작업표시줄 아이콘 지정 (없으면 generate_icon.py 로 생성 안내)
     if ICON_FILE.exists():
         cmd += ["--icon", str(ICON_FILE)]
+        # 실행 중 창/작업표시줄/트레이 아이콘도 같은 .ico 를 로드하도록
+        # onefile 번들에 포함한다(make_app_icon 이 resource_path 로 찾음).
+        cmd += ["--add-data", f"{ICON_FILE}{os.pathsep}."]
     else:
         print("[경고] keyflux.ico 가 없습니다. 'python generate_icon.py' 로 "
               "먼저 아이콘을 생성하면 exe 에 아이콘이 적용됩니다.")
@@ -53,11 +70,12 @@ def main():
         shutil.copy(RULES_FILE, dest)
         print(f"[완료] {dest} 복사됨")
 
-    print("\n✅ 빌드 완료!")
-    print(f"   실행파일: {dist_dir / 'KeyFlux'}{'.exe' if sys.platform == 'win32' else ''}")
+    exe_name = APP_NAME + (".exe" if sys.platform == "win32" else "")
+    print("\nBuild complete!")
+    print(f"   실행파일: {dist_dir / exe_name}")
     if include_rules:
         print(f"   설정파일: {dist_dir / 'rules.json'}")
-        print("\n   배포 시 KeyFlux.exe + rules.json 을 함께 전달하세요.")
+        print(f"\n   배포 시 {exe_name} + rules.json 을 함께 전달하세요.")
     else:
         print("\n   설정은 실행 후 홈디렉토리에 자동 저장됩니다.")
         print("   특정 rules.json 을 동봉하려면: python build.py --with-rules")

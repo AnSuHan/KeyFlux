@@ -12,7 +12,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTableWidget, QTableWidgetItem, QLabel, QLineEdit,
     QDialog, QFormLayout, QComboBox, QMessageBox, QSystemTrayIcon,
-    QMenu, QHeaderView, QFrame, QCheckBox, QFileDialog
+    QMenu, QHeaderView, QFrame, QCheckBox, QFileDialog, QGroupBox,
+    QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QIcon, QColor, QFont, QPixmap, QPainter
@@ -1331,10 +1332,38 @@ def _render_icon_pixmap(size: int) -> QPixmap:
     return pix
 
 
+def resource_path(name: str) -> str:
+    """리소스 파일의 실제 경로. 개발 실행에서는 소스 폴더, PyInstaller
+    onefile 실행에서는 임시 추출 폴더(sys._MEIPASS)를 기준으로 찾는다."""
+    base = getattr(sys, "_MEIPASS",
+                   os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
+_APP_ICON_CACHE = None
+
+
 def make_app_icon() -> QIcon:
+    """창·작업표시줄·트레이·exe 파일이 모두 같은 아이콘을 쓰도록, exe
+    파비콘과 동일한 keyflux.ico 를 단일 출처로 로드한다. (예전엔 실행 중
+    아이콘만 코드로 따로 그려서 작업표시줄 아이콘이 exe 와 달라질 수 있었다.)
+    파일이 없거나 로드에 실패하면 같은 디자인을 코드로 그려 폴백한다."""
+    global _APP_ICON_CACHE
+    if _APP_ICON_CACHE is not None:
+        return _APP_ICON_CACHE
+
     icon = QIcon()
-    for s in (16, 24, 32, 48, 64, 128, 256):
-        icon.addPixmap(_render_icon_pixmap(s))
+    ico_path = resource_path("keyflux.ico")
+    if os.path.exists(ico_path):
+        loaded = QIcon(ico_path)
+        if not loaded.isNull() and loaded.availableSizes():
+            icon = loaded
+
+    if icon.isNull():  # 파일이 없거나 로드 실패 → 코드 렌더로 폴백
+        for s in (16, 24, 32, 48, 64, 128, 256):
+            icon.addPixmap(_render_icon_pixmap(s))
+
+    _APP_ICON_CACHE = icon
     return icon
 
 
@@ -1417,6 +1446,14 @@ class MainWindow(QMainWindow):
                 width: 16px; height: 16px; border-radius: 4px;
                 border: 1px solid #444; background: #141620; }
             QCheckBox::indicator:checked { background: #7C5CBF; border-color: #7C5CBF; }
+
+            QGroupBox {
+                border: 1px solid #252840; border-radius: 8px;
+                margin-top: 12px; padding: 12px 14px 10px 14px;
+                font-weight: 600; }
+            QGroupBox::title {
+                subcontrol-origin: margin; left: 12px; padding: 0 5px;
+                color: #9370DB; font-weight: 700; }
 
             /* 스크롤바: 다크 테마에 맞춘 또렷하고 직관적인 모양.
                (기본 OS 스크롤바가 어두운 UI 와 안 어울려 잘 안 보이던 문제 개선)
@@ -1512,6 +1549,16 @@ class MainWindow(QMainWindow):
         import_btn.setToolTip("JSON 파일에서 규칙을 불러옵니다")
         import_btn.clicked.connect(self._import_rules)
 
+        # 동작 옵션(한/영 무관·대소문자·알림·자동실행·디버그)은 별도 설정
+        # 창에서 조작한다. 체크박스 위젯 자체는 여기서 만들어 두고(핸들러가
+        # self.*_chk 를 참조하므로) 설정 창이 레이아웃에 배치한다.
+        self._create_option_widgets()
+
+        settings_btn = QPushButton("⚙ 설정")
+        settings_btn.setObjectName("secondary")
+        settings_btn.setToolTip("동작 옵션을 설정 창에서 조작합니다")
+        settings_btn.clicked.connect(self._open_settings)
+
         toolbar.addWidget(add_btn)
         toolbar.addWidget(edit_btn)
         toolbar.addWidget(del_btn)
@@ -1521,54 +1568,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(export_btn)
         toolbar.addWidget(import_btn)
         toolbar.addStretch()
-
-        # 한/영·대소문자 무관 매칭 옵션 (기본 활성화)
-        self.normalize_chk = QCheckBox("한/영·대소문자 무관")
-        self.normalize_chk.setChecked(
-            bool(self.settings.get("normalize_mode", True)))
-        self.normalize_chk.setToolTip(
-            "켜면 한/영 입력 상태나 대소문자와 상관없이 트리거가 동작합니다.\n"
-            "(예: 영문 모드든 한글 모드든 같은 키를 누르면 변환)")
-        self.normalize_chk.stateChanged.connect(self._toggle_normalize)
-        toolbar.addWidget(self.normalize_chk)
-
-        # 결과 대소문자 보장 옵션 (기본 켜짐) — 매칭 옵션과 별개로 on/off
-        self.case_chk = QCheckBox("결과 대소문자 보장")
-        self.case_chk.setChecked(
-            bool(self.settings.get("output_case_guarantee", True)))
-        self.case_chk.setToolTip(
-            "켜면 CapsLock 이 켜져 있어도 출력 결과의 대소문자가\n"
-            "저장한 그대로 들어갑니다. 끄면 CapsLock 상태에 따라\n"
-            "대소문자가 뒤집힐 수 있습니다.")
-        self.case_chk.stateChanged.connect(self._toggle_case_guarantee)
-        toolbar.addWidget(self.case_chk)
-
-        # 윈도우 알림(트레이 풍선) 출력 여부 (기본 켜짐)
-        self.notify_chk = QCheckBox("알림 표시")
-        self.notify_chk.setChecked(
-            bool(self.settings.get("notifications_enabled", True)))
-        self.notify_chk.setToolTip(
-            "켜면 변환 결과와 트레이 안내를 윈도우 알림(풍선)으로 표시합니다.")
-        self.notify_chk.stateChanged.connect(self._toggle_notifications)
-        toolbar.addWidget(self.notify_chk)
-
-        # 시작 시 자동 실행 (Windows 시작 프로그램 등록)
-        self.startup_chk = QCheckBox("시작 시 자동 실행")
-        self.startup_chk.setChecked(is_startup_enabled())
-        self.startup_chk.setEnabled(sys.platform == "win32")
-        self.startup_chk.setToolTip(
-            "켜면 Windows 로그인 시 KeyFlux 가 자동으로 실행됩니다.")
-        self.startup_chk.stateChanged.connect(self._toggle_startup)
-        toolbar.addWidget(self.startup_chk)
-
-        # 디버그 로그 (진단용). 켜면 keyflux_debug.log 에 감지/주입 과정 기록
-        self.debug_chk = QCheckBox("디버그 로그")
-        self.debug_chk.setChecked(bool(self.settings.get("debug_log", False)))
-        self.debug_chk.setToolTip(
-            "켜면 키 감지·치환·주입 과정을 파일로 기록합니다.\n"
-            f"기록 위치: {DEBUG_LOG_FILE}")
-        self.debug_chk.stateChanged.connect(self._toggle_debug)
-        toolbar.addWidget(self.debug_chk)
+        toolbar.addWidget(settings_btn)
 
         root.addLayout(toolbar)
         root.addSpacing(10)
@@ -1619,6 +1619,100 @@ class MainWindow(QMainWindow):
         root.addLayout(status_row)
 
         self._refresh_table()
+
+    # ── 설정 옵션 위젯 & 설정 창 ──────────────────────────────────
+    def _create_option_widgets(self):
+        """동작 옵션 체크박스들을 생성한다(레이아웃 배치는 설정 창에서).
+        토글 핸들러들이 self.*_chk 를 참조하므로 위젯은 메인윈도우가 소유한다."""
+        # 한/영·대소문자 무관 매칭 (기본 켜짐)
+        self.normalize_chk = QCheckBox("한/영·대소문자 무관 매칭")
+        self.normalize_chk.setChecked(
+            bool(self.settings.get("normalize_mode", True)))
+        self.normalize_chk.setToolTip(
+            "켜면 한/영 입력 상태나 대소문자와 상관없이 트리거가 동작합니다.\n"
+            "(예: 영문 모드든 한글 모드든 같은 키를 누르면 변환)")
+        self.normalize_chk.stateChanged.connect(self._toggle_normalize)
+
+        # 결과 대소문자 보장 (기본 켜짐)
+        self.case_chk = QCheckBox("결과 대소문자 보장")
+        self.case_chk.setChecked(
+            bool(self.settings.get("output_case_guarantee", True)))
+        self.case_chk.setToolTip(
+            "켜면 CapsLock 이 켜져 있어도 출력 결과의 대소문자가\n"
+            "저장한 그대로 들어갑니다. 끄면 CapsLock 상태에 따라\n"
+            "대소문자가 뒤집힐 수 있습니다.")
+        self.case_chk.stateChanged.connect(self._toggle_case_guarantee)
+
+        # 윈도우 알림(트레이 풍선) 표시 (기본 켜짐)
+        self.notify_chk = QCheckBox("알림 표시")
+        self.notify_chk.setChecked(
+            bool(self.settings.get("notifications_enabled", True)))
+        self.notify_chk.setToolTip(
+            "켜면 변환 결과와 트레이 안내를 윈도우 알림(풍선)으로 표시합니다.")
+        self.notify_chk.stateChanged.connect(self._toggle_notifications)
+
+        # 시작 시 자동 실행 (Windows 시작 프로그램 등록)
+        self.startup_chk = QCheckBox("시작 시 자동 실행")
+        self.startup_chk.setChecked(is_startup_enabled())
+        self.startup_chk.setEnabled(sys.platform == "win32")
+        self.startup_chk.setToolTip(
+            "켜면 Windows 로그인 시 KeyFlux 가 자동으로 실행됩니다.")
+        self.startup_chk.stateChanged.connect(self._toggle_startup)
+
+        # 디버그 로그 (진단용)
+        self.debug_chk = QCheckBox("디버그 로그")
+        self.debug_chk.setChecked(bool(self.settings.get("debug_log", False)))
+        self.debug_chk.setToolTip(
+            "켜면 키 감지·치환·주입 과정을 파일로 기록합니다.\n"
+            f"기록 위치: {DEBUG_LOG_FILE}")
+        self.debug_chk.stateChanged.connect(self._toggle_debug)
+
+        # 설정 창은 최초 열 때 한 번만 만들어 재사용한다.
+        self._settings_dialog = None
+
+    def _build_settings_dialog(self) -> QDialog:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("KeyFlux 설정")
+        dlg.setWindowIcon(make_app_icon())
+        dlg.setMinimumWidth(420)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(20, 18, 20, 16)
+        lay.setSpacing(14)
+
+        match_box = QGroupBox("매칭 동작")
+        mb = QVBoxLayout(match_box)
+        mb.setSpacing(8)
+        mb.addWidget(self.normalize_chk)
+        mb.addWidget(self.case_chk)
+        lay.addWidget(match_box)
+
+        sys_box = QGroupBox("알림 · 시작")
+        sb = QVBoxLayout(sys_box)
+        sb.setSpacing(8)
+        sb.addWidget(self.notify_chk)
+        sb.addWidget(self.startup_chk)
+        lay.addWidget(sys_box)
+
+        diag_box = QGroupBox("진단")
+        db = QVBoxLayout(diag_box)
+        db.setSpacing(8)
+        db.addWidget(self.debug_chk)
+        lay.addWidget(diag_box)
+
+        lay.addStretch()
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btns.accepted.connect(dlg.hide)
+        btns.rejected.connect(dlg.hide)
+        lay.addWidget(btns)
+        return dlg
+
+    def _open_settings(self):
+        if self._settings_dialog is None:
+            self._settings_dialog = self._build_settings_dialog()
+        dlg = self._settings_dialog
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     # ── 테이블 갱신 ──────────────────────────────────────────────
     def _refresh_table(self):
