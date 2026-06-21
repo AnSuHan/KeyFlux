@@ -338,5 +338,28 @@ class TestDiagnosticsSmoke(unittest.TestCase):
             self.assertTrue(main._startup_target_command())
 
 
+# ── 결과 대소문자 보장 옵션 ────────────────────────────────────────
+class TestCaseGuaranteeOption(unittest.TestCase):
+    def test_default_setting_on(self):
+        # 기본값은 전부 켜짐 — 결과 대소문자 보장도 기본 True
+        self.assertTrue(main.DEFAULT_SETTINGS["output_case_guarantee"])
+
+    def test_listener_default_on(self):
+        L = main.KeyboardListener()
+        self.assertTrue(L.case_guarantee)
+
+    def test_setter_toggles(self):
+        L = main.KeyboardListener()
+        L.set_case_guarantee(False)
+        self.assertFalse(L.case_guarantee)
+        L.set_case_guarantee(True)
+        self.assertTrue(L.case_guarantee)
+
+    def test_send_text_accepts_case_guarantee(self):
+        # 빈 문자열은 어느 플랫폼에서든 예외 없이 True 반환(시그니처 검증)
+        self.assertTrue(main.send_text("", case_guarantee=True))
+        self.assertTrue(main.send_text("", case_guarantee=False))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

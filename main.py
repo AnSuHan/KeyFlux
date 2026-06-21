@@ -141,9 +141,10 @@ if sys.platform == "win32":
             dbg(f"SendInput(scancode) sent={sent}/{n} err={ctypes.get_last_error()}")
         return sent == n
 
-    def _char_key_events(ch: str):
+    def _char_key_events(ch: str, case_guarantee: bool = True):
         """한 글자를 스캔코드 키 이벤트 리스트로 변환.
-        키보드로 칠 수 없는 글자면 None(→ 호출자가 유니코드로 폴백)."""
+        키보드로 칠 수 없는 글자면 None(→ 호출자가 유니코드로 폴백).
+        case_guarantee=False면 CapsLock 보정을 건너뛴다(아래 참조)."""
         if ch == "\r":
             return []
         if ch in _SPECIAL_VK:
@@ -161,7 +162,9 @@ if sys.platform == "win32":
         # CapsLock 보정: ASCII 알파벳은 CapsLock 토글이 켜져 있으면 실제
         # 들어가는 대소문자가 뒤집힌다. 저장된 글자 그대로(저장된 대소문자로)
         # 주입되도록, CapsLock 이 켜져 있을 때 알파벳의 shift 요구를 반전한다.
-        if ch.isascii() and ch.isalpha() and (_GetKeyState(_VK_CAPITAL) & 0x0001):
+        # (옵션 case_guarantee 가 꺼져 있으면 보정하지 않아 CapsLock 영향을 받음)
+        if (case_guarantee and ch.isascii() and ch.isalpha()
+                and (_GetKeyState(_VK_CAPITAL) & 0x0001)):
             shift_state ^= 1
         sc = _MapVirtualKeyW(vk, 0)
         if sc == 0:
@@ -176,15 +179,17 @@ if sys.platform == "win32":
             evs.append((_VK_SHIFT, sh_sc, _KEYEVENTF_SCANCODE | _KEYEVENTF_KEYUP))
         return evs
 
-    def send_text(text: str, char_delay: float = 0.01) -> bool:
+    def send_text(text: str, char_delay: float = 0.01,
+                  case_guarantee: bool = True) -> bool:
         """text 를 글자 단위로 주입. 칠 수 있는 글자는 스캔코드 키로,
         못 치는 글자는 유니코드로. GUI·터미널 모두에서 동작.
-        콘솔 줄 편집기가 빠른 연속 입력을 흘리지 않도록 글자당 짧게 지연."""
+        콘솔 줄 편집기가 빠른 연속 입력을 흘리지 않도록 글자당 짧게 지연.
+        case_guarantee=False면 CapsLock 보정 없이 주입한다."""
         if not text:
             return True
         ok = True
         for ch in text:
-            evs = _char_key_events(ch)
+            evs = _char_key_events(ch, case_guarantee)
             if evs is None:
                 if not send_unicode_string(ch):
                     ok = False
@@ -286,7 +291,8 @@ else:
         """비-Windows: 직접 주입 미지원. 호출자가 폴백 타이핑을 쓰도록 False 반환."""
         return False
 
-    def send_text(text: str, char_delay: float = 0.01) -> bool:
+    def send_text(text: str, char_delay: float = 0.01,
+                  case_guarantee: bool = True) -> bool:
         """비-Windows: 직접 주입 미지원. 호출자가 폴백 타이핑을 쓰도록 False 반환."""
         return False
 
@@ -356,6 +362,9 @@ SETTINGS_FILE = DATA_FILE.parent / (
 DEFAULT_SETTINGS = {
     # 켜면 한/영 입력 상태나 대소문자와 상관없이 트리거가 동작한다.
     "normalize_mode": True,
+    # 켜면 출력 결과의 대소문자를 보장한다(CapsLock 이 켜져 있어도 저장된
+    # 대소문자 그대로 주입). 끄면 CapsLock 상태에 따라 대소문자가 뒤집힌다.
+    "output_case_guarantee": True,
     # 켜면 변환/트레이 안내를 윈도우 알림(트레이 풍선)으로 띄운다.
     "notifications_enabled": True,
     # 켜면 키 감지·치환·주입 과정을 keyflux_debug.log 에 기록한다(진단용).
@@ -739,6 +748,9 @@ class KeyboardListener(QObject):
         # 한/영·대소문자 무관 매칭 옵션 (기본 활성화). True면 입력/트리거를
         # 물리 키 시퀀스로 정규화해 비교한다(normalize_keyseq 참조).
         self.normalize_mode = True
+        # 결과 대소문자 보장 옵션(기본 활성화). True면 CapsLock 이 켜져 있어도
+        # 저장된 대소문자 그대로 주입한다(send_text 의 case_guarantee 로 전달).
+        self.case_guarantee = True
         # 트리거 문자열 -> 정규화된 키 시퀀스 캐시 (normalize_mode일 때만 채움)
         self._norm_triggers = {}
         # ── 접두사 겹침 트리거 보류 상태 ──────────────────────────
@@ -760,6 +772,10 @@ class KeyboardListener(QObject):
         with self._lock:
             self.normalize_mode = bool(val)
             self._rebuild_indexes()
+
+    def set_case_guarantee(self, val: bool):
+        """결과 대소문자 보장 옵션을 켜고 끈다(주입 시 CapsLock 보정 여부)."""
+        self.case_guarantee = bool(val)
 
     def _rebuild_indexes(self):
         """빠른 필터 인덱스와 정규화 트리거 캐시를 self.rules 기준으로 재생성.
@@ -1139,8 +1155,8 @@ class KeyboardListener(QObject):
                 if saved_ime:
                     # IME 모드 전환이 반영될 시간을 짧게 준다
                     time.sleep(0.01)
-                ok = send_text(to_type)
-                dbg(f"send_text ok={ok}")
+                ok = send_text(to_type, case_guarantee=self.case_guarantee)
+                dbg(f"send_text ok={ok} case_guarantee={self.case_guarantee}")
                 if not ok:
                     # 폴백: 비-Windows이거나 주입 실패 시 pynput 타이핑
                     self.controller.type(to_type)
@@ -1516,6 +1532,17 @@ class MainWindow(QMainWindow):
         self.normalize_chk.stateChanged.connect(self._toggle_normalize)
         toolbar.addWidget(self.normalize_chk)
 
+        # 결과 대소문자 보장 옵션 (기본 켜짐) — 매칭 옵션과 별개로 on/off
+        self.case_chk = QCheckBox("결과 대소문자 보장")
+        self.case_chk.setChecked(
+            bool(self.settings.get("output_case_guarantee", True)))
+        self.case_chk.setToolTip(
+            "켜면 CapsLock 이 켜져 있어도 출력 결과의 대소문자가\n"
+            "저장한 그대로 들어갑니다. 끄면 CapsLock 상태에 따라\n"
+            "대소문자가 뒤집힐 수 있습니다.")
+        self.case_chk.stateChanged.connect(self._toggle_case_guarantee)
+        toolbar.addWidget(self.case_chk)
+
         # 윈도우 알림(트레이 풍선) 출력 여부 (기본 켜짐)
         self.notify_chk = QCheckBox("알림 표시")
         self.notify_chk.setChecked(
@@ -1797,6 +1824,15 @@ class MainWindow(QMainWindow):
         self.status_label.setText(
             "한/영·대소문자 무관 매칭 " + ("켜짐" if val else "꺼짐"))
 
+    # ── 결과 대소문자 보장 토글 ──────────────────────────────────
+    def _toggle_case_guarantee(self, state):
+        val = bool(state)
+        self.settings["output_case_guarantee"] = val
+        save_settings(self.settings)
+        self.listener.set_case_guarantee(val)
+        self.status_label.setText(
+            "결과 대소문자 보장 " + ("켜짐" if val else "꺼짐"))
+
     # ── 윈도우 알림 표시 토글 ────────────────────────────────────
     def _toggle_notifications(self, state):
         val = bool(state)
@@ -1866,6 +1902,8 @@ class MainWindow(QMainWindow):
         """UI 빌드 전에 listener 객체를 먼저 생성 (rules 참조용)"""
         self.listener = KeyboardListener()
         self.listener.normalize_mode = bool(self.settings.get("normalize_mode", True))
+        self.listener.case_guarantee = bool(
+            self.settings.get("output_case_guarantee", True))
         self.listener.set_rules(self.rules)
 
     def _connect_listener_signals(self):
