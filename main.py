@@ -435,11 +435,33 @@ def save_settings(settings):
     except Exception:
         pass
 
+# ── 관리자 권한 확인 ──────────────────────────────────────────────
+# KeyFlux 는 관리자 권한으로 실행되어야 관리자 권한 앱(관리자 VSCode·터미널)
+# 에서도 키 후킹·주입이 동작한다(Windows UIPI: 일반 권한 후크/주입은 승격된
+# 창에 닿지 못함). 배포 exe 는 --uac-admin 매니페스트로 항상 승격 실행된다.
+def is_elevated() -> bool:
+    """현재 프로세스가 관리자 권한으로 실행 중인지."""
+    if sys.platform != "win32":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
 # ── 시작 프로그램 등록 (Windows 시작 시 자동 실행) ─────────────────
-# HKCU\...\Run 에 실행 명령을 등록/해제해, 로그인 시 KeyFlux 가 자동
-# 실행되게 한다. (관리자 권한이 필요 없는 사용자 단위 등록)
+# 관리자 권한 앱은 HKCU\...\Run 으로는 로그인 시 자동기동되지 않으므로(Run 은
+# 승격 실행을 못 함), 작업 스케줄러에 "최고 권한으로 실행(/RL HIGHEST)" 작업을
+# 만들어 로그인 시 UAC 창 없이 관리자 권한으로 자동 실행되게 한다.
 _RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _RUN_VALUE = "KeyFlux"
+_TASK_NAME = "KeyFlux"
+
+def _no_window_kwargs() -> dict:
+    """schtasks 등 콘솔 명령을 창 없이 조용히 실행하기 위한 subprocess kwargs."""
+    kw = {"capture_output": True, "text": True}
+    if sys.platform == "win32":
+        kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    return kw
 
 def _startup_target_command() -> str:
     """시작 시 실행할 명령 문자열.
@@ -451,36 +473,55 @@ def _startup_target_command() -> str:
     launcher = pyw if pyw.exists() else Path(sys.executable)
     return f'"{launcher}" "{Path(__file__).resolve()}"'
 
-def is_startup_enabled() -> bool:
-    """현재 시작 프로그램에 등록되어 있는지 (레지스트리 실제 상태)."""
+def _remove_legacy_run_entry():
+    """과거 버전이 남긴 HKCU\\Run 자동시작 항목 제거(작업 스케줄러로 이관)."""
     if sys.platform != "win32":
-        return False
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
-            val, _ = winreg.QueryValueEx(key, _RUN_VALUE)
-            return bool(val)
-    except OSError:
-        return False
-
-def set_startup(enabled: bool) -> bool:
-    """시작 프로그램 등록/해제. 성공 시 True."""
-    if sys.platform != "win32":
-        return False
+        return
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
                             winreg.KEY_SET_VALUE) as key:
-            if enabled:
-                winreg.SetValueEx(key, _RUN_VALUE, 0, winreg.REG_SZ,
-                                  _startup_target_command())
-            else:
-                try:
-                    winreg.DeleteValue(key, _RUN_VALUE)
-                except FileNotFoundError:
-                    pass
-        return True
+            try:
+                winreg.DeleteValue(key, _RUN_VALUE)
+            except FileNotFoundError:
+                pass
     except OSError:
+        pass
+
+def is_startup_enabled() -> bool:
+    """작업 스케줄러에 KeyFlux 자동시작 작업이 등록돼 있는지(실제 상태)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import subprocess
+        r = subprocess.run(["schtasks", "/Query", "/TN", _TASK_NAME],
+                           **_no_window_kwargs())
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def set_startup(enabled: bool) -> bool:
+    """자동시작 작업 등록/해제(최고 권한). 성공 시 True.
+    작업 생성/삭제에는 관리자 권한이 필요하다(앱이 관리자로 실행되므로 충족)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import subprocess
+        if enabled:
+            _remove_legacy_run_entry()  # 옛 Run 항목과 중복 방지
+            r = subprocess.run(
+                ["schtasks", "/Create", "/TN", _TASK_NAME,
+                 "/TR", _startup_target_command(),
+                 "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"],
+                **_no_window_kwargs())
+            return r.returncode == 0
+        else:
+            r = subprocess.run(["schtasks", "/Delete", "/TN", _TASK_NAME, "/F"],
+                              **_no_window_kwargs())
+            _remove_legacy_run_entry()
+            # 작업이 원래 없었어도 "해제됨"으로 간주
+            return r.returncode == 0 or not is_startup_enabled()
+    except Exception:
         return False
 
 # ── 디버그 로깅 ──────────────────────────────────────────────────
@@ -1429,7 +1470,9 @@ def make_app_icon() -> QIcon:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"KeyFlux v{APP_VERSION}")
+        # 관리자 권한 실행 여부를 제목에 표시(관리자 앱 대응 동작 확인용)
+        self.setWindowTitle(
+            f"KeyFlux v{APP_VERSION}" + (" (관리자)" if is_elevated() else ""))
         self.setMinimumSize(700, 540)
         self.setWindowIcon(make_app_icon())  # 창/작업표시줄 아이콘
         self.rules = load_rules()

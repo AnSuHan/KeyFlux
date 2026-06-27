@@ -82,6 +82,7 @@ def main():
         "--name", APP_NAME,     # 버전 포함 파일명 (KeyFlux_v1.0.3)
         "--clean",
         "--version-file", str(_write_version_file()),  # EXE 버전정보(오탐 완화)
+        "--uac-admin",          # 항상 관리자 권한으로 실행(관리자 앱 후킹/주입)
     ]
 
     # exe 파일/작업표시줄 아이콘 지정 (없으면 generate_icon.py 로 생성 안내)

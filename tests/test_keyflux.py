@@ -330,8 +330,12 @@ class TestDiagnosticsSmoke(unittest.TestCase):
         self.assertIsInstance(main.foreground_window_info(), str)
 
     def test_is_startup_enabled_returns_bool(self):
-        # 레지스트리를 변경하지 않고 조회만 — 항상 bool 반환
+        # 작업 스케줄러를 변경하지 않고 조회만 — 항상 bool 반환
         self.assertIsInstance(main.is_startup_enabled(), bool)
+
+    def test_is_elevated_returns_bool(self):
+        # 관리자 권한 여부 조회 — 항상 bool 반환(예외 없이)
+        self.assertIsInstance(main.is_elevated(), bool)
 
     def test_startup_target_command_nonempty(self):
         if sys.platform == "win32":
