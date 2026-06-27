@@ -54,3 +54,6 @@ Desktop.ini
 
 # ===== 로그 =====
 *.log
+
+# build.py 가 생성하는 EXE 버전정보 리소스
+version_info.txt
