@@ -361,5 +361,67 @@ class TestCaseGuaranteeOption(unittest.TestCase):
         self.assertTrue(main.send_text("", case_guarantee=False))
 
 
+# ── 주입 방식 선택 (콘솔=스캔코드 / 그 외=유니코드) ────────────────
+class TestInjectionMethodSelection(unittest.TestCase):
+    """대상 창 종류에 따라 스캔코드/유니코드 주입을 고르는 로직 검증.
+    (#2 VSCode 터미널 미입력 · #1 입력 언어 보존의 핵심 분기)"""
+
+    def test_foreground_needs_scancode_returns_bool(self):
+        # 실제 포그라운드 창을 조회하지만 항상 bool 을 반환해야 한다.
+        self.assertIsInstance(main.foreground_needs_scancode(), bool)
+
+    def test_send_text_accepts_force_unicode(self):
+        # 빈 문자열은 어느 플랫폼에서든 예외 없이 True (시그니처 검증)
+        self.assertTrue(main.send_text("", force_unicode=True))
+        self.assertTrue(main.send_text("", force_unicode=False))
+
+    @unittest.skipUnless(sys.platform == "win32", "win32 전용 상수")
+    def test_console_classes_use_scancode(self):
+        # 사용자가 검증한 콘솔(PowerShell/cmd/Windows Terminal/Git Bash 등)은
+        # 반드시 스캔코드 화이트리스트에 들어 있어야 IME 강제·복원 경로를 탄다.
+        for cls in ("ConsoleWindowClass",            # conhost: powershell.exe·cmd.exe
+                    "CASCADIA_HOSTING_WINDOW_CLASS",  # Windows Terminal
+                    "mintty",                         # Git Bash
+                    "VirtualConsoleClass"):           # ConEmu·Cmder
+            self.assertIn(cls, main._SCANCODE_WINDOW_CLASSES)
+
+    @unittest.skipUnless(sys.platform == "win32", "win32 전용 상수")
+    def test_gui_and_chromium_use_unicode(self):
+        # VSCode 등 Electron/Chromium(Chrome_WidgetWin_1)과 일반 GUI 는
+        # 스캔코드 화이트리스트에 없어야 한다 → 유니코드 직접 주입 경로.
+        for cls in ("Chrome_WidgetWin_1",  # VSCode·Electron·Chrome
+                    "Notepad",             # 일반 Win32 GUI
+                    "Qt5152QWindowIcon",   # 임의 Qt 앱
+                    ""):                   # 알 수 없음 → 유니코드 기본
+            self.assertNotIn(cls, main._SCANCODE_WINDOW_CLASSES)
+
+
+# ── 규칙 추가 다이얼로그: 타입 순서/저장 (단축어 1순위) ─────────────
+class TestRuleDialogTypeOrder(unittest.TestCase):
+    """규칙 추가 시 special(단축어)이 1순위·기본 선택이고, 각 타입이
+    올바른 콤보 인덱스로 저장/복원되는지 검증."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_special_is_first_item(self):
+        d = main.RuleDialog()
+        self.assertTrue(d.type_combo.itemText(0).startswith("special"))
+
+    def test_new_rule_default_is_special(self):
+        # 신규 추가(규칙 미지정) 시 기본 선택 타입이 special 이어야 한다.
+        d = main.RuleDialog()
+        self.assertEqual(d.get_rule()["type"], "special")
+
+    def test_type_roundtrip(self):
+        # 각 타입을 로드하면 올바른 인덱스로 복원되고, 저장 시 같은 타입이 나온다.
+        for t in ("special", "word", "regex"):
+            d = main.RuleDialog(
+                rule={"type": t, "trigger": "x", "output": "y", "enabled": True})
+            self.assertEqual(d.get_rule()["type"], t)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,10 +1,10 @@
 # KeyFlux — 키 입력 자동 변환기
 
-> **v1.0.3**
+> **v1.0.4**
 
 등록한 트리거(단어/단축어/정규식)를 타이핑하면 지정한 텍스트로 자동
 치환해 주는 백그라운드 도구입니다. 메모장·브라우저뿐 아니라 터미널
-(PowerShell/cmd/Git Bash)에서도 동작합니다.
+(PowerShell/cmd/Git Bash·**VSCode 통합 터미널**)에서도 동작합니다.
 
 ## 주요 기능
 
@@ -20,6 +20,12 @@
 - **규칙 편집창에서 Enter 로 저장** (v1.0.2)
 - **`;;` 규칙 1순위 정렬** (v1.0.3): 트리거가 `;;` 로 시작하는 규칙을 목록
   맨 위로 항상 정렬(같은 그룹 내 순서는 유지).
+- **VSCode·Electron 터미널 호환** (v1.0.4): VSCode 통합 터미널처럼 Chromium
+  기반 앱에서도 치환이 정상 입력됨(이전엔 입력이 안 됐음).
+- **입력 언어(한/영) 보존** (v1.0.4): 치환이 끝나면 키워드를 입력하기 전의
+  한/영 상태가 그대로 유지됨(출력이 한글이든 영어든 무관).
+- **규칙 추가 시 단축어(`special`)가 기본·1순위** (v1.0.4): 새 규칙 추가 창에서
+  타입 기본 선택이 `special`(`;`단축어).
 - **시작 시 자동 실행 / 윈도우 알림 표시 / 디버그 로그** 토글 (설정 창)
 - **결과 대소문자 보장** 옵션 (기본 활성화, 설정 창): CapsLock 이
   켜져 있어도 출력 결과의 대소문자가 저장한 그대로 들어감. 매칭 옵션과
@@ -122,7 +128,7 @@ pip install pyinstaller
 python build.py
 ```
 
-빌드가 끝나면 **버전이 포함된** `dist\KeyFlux_v<버전>.exe`(예: `dist\KeyFlux_v1.0.3.exe`)가 생성됩니다. 이 파일 하나만 복사해서 Python이 설치되지 않은 PC에서도 바로 실행할 수 있습니다. (GitHub 릴리스에 올리는 실행파일명에는 항상 버전을 포함합니다.)
+빌드가 끝나면 **버전이 포함된** `dist\KeyFlux_v<버전>.exe`(예: `dist\KeyFlux_v1.0.4.exe`)가 생성됩니다. 이 파일 하나만 복사해서 Python이 설치되지 않은 PC에서도 바로 실행할 수 있습니다. (GitHub 릴리스에 올리는 실행파일명에는 항상 버전을 포함합니다.)
 
 ### 3. 특정 규칙(rules.json)을 포함해서 배포하기
 
@@ -137,7 +143,7 @@ python build.py --with-rules
 ### 4. 직접 PyInstaller 명령으로 빌드하고 싶다면
 
 ```powershell
-pyinstaller --onefile --windowed --name KeyFlux_v1.0.3 ^
+pyinstaller --onefile --windowed --name KeyFlux_v1.0.4 ^
   --icon keyflux.ico --add-data "keyflux.ico;." main.py
 ```
 
@@ -177,6 +183,19 @@ python -m unittest discover -s tests -v
 ---
 
 ## 변경 이력
+
+### v1.0.4
+- **VSCode·Electron/Chromium 터미널 입력 수정**: VSCode 통합 터미널 등
+  Chromium 기반 창은 레거시 `WM_IME_CONTROL`(IME 변환모드 제어)을 무시해,
+  기존 "스캔코드+IME 강제" 방식이 안 먹혀 치환이 **아예 입력되지 않던** 문제를
+  해결. 대상 창이 콘솔 줄 편집기(conhost/Windows Terminal/Git Bash 등)면
+  스캔코드, 그 외 일반 GUI·Electron 이면 **유니코드 직접 주입**으로 분기.
+- **입력 언어(한/영) 보존 강화**: 유니코드 직접 주입은 IME를 거치지 않아
+  영문 출력이 한글로 바뀌지 않고, IME 모드를 건드리지 않으므로 **키워드
+  입력 전의 한/영 상태가 그대로 유지**됨(콘솔은 기존처럼 IME 강제→복원).
+- **규칙 추가 시 단축어(`special`)가 1순위·기본 선택**: 규칙 추가 창의 타입
+  콤보 순서를 `special → word → regex` 로 변경.
+- 단위 테스트 보완(주입 방식 분기·규칙 타입 순서, 총 47개).
 
 ### v1.0.3
 - **설정 창 분리**: 동작 옵션(한/영·대소문자 무관 매칭, 결과 대소문자 보장,

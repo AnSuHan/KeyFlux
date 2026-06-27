@@ -22,7 +22,7 @@ from pynput.keyboard import Key, Controller
 import ctypes
 
 # 앱 버전 (SemVer). 릴리스 태그 v<버전> 과 일치시킨다.
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 
 
 # ── 유니코드 직접 주입 (Windows SendInput) ───────────────────────
@@ -181,15 +181,24 @@ if sys.platform == "win32":
         return evs
 
     def send_text(text: str, char_delay: float = 0.01,
-                  case_guarantee: bool = True) -> bool:
+                  case_guarantee: bool = True,
+                  force_unicode: bool = False) -> bool:
         """text 를 글자 단위로 주입. 칠 수 있는 글자는 스캔코드 키로,
         못 치는 글자는 유니코드로. GUI·터미널 모두에서 동작.
         콘솔 줄 편집기가 빠른 연속 입력을 흘리지 않도록 글자당 짧게 지연.
-        case_guarantee=False면 CapsLock 보정 없이 주입한다."""
+        case_guarantee=False면 CapsLock 보정 없이 주입한다.
+        force_unicode=True면 일반 글자도 유니코드로 직접 주입한다(IME 미경유
+        → 입력 언어 보존·Chromium 호환). 단 줄바꿈/탭은 '진짜 키'로 보내야
+        하므로 그대로 스캔코드(전용 가상키)로 보낸다."""
         if not text:
             return True
         ok = True
         for ch in text:
+            if force_unicode and ch not in ("\n", "\t", "\r"):
+                if not send_unicode_string(ch):
+                    ok = False
+                time.sleep(char_delay)
+                continue
             evs = _char_key_events(ch, case_guarantee)
             if evs is None:
                 if not send_unicode_string(ch):
@@ -271,6 +280,37 @@ if sys.platform == "win32":
         except Exception:
             return "(fg-info error)"
 
+    # ── 주입 방식 선택 (콘솔 vs 일반 GUI) ─────────────────────────
+    # 콘솔 줄 편집기(conhost·Windows Terminal·mintty 등)는 KEYEVENTF_UNICODE
+    # 로 주입한 글자를 흘려버려 스캔코드로 보내야 한다(→ IME 강제/복원 필요).
+    # 그 외 일반 GUI·Electron/Chromium(VSCode 통합 터미널 등)은 반대로,
+    # 유니코드로 직접 주입해야 한다:
+    #   ① 유니코드는 IME 를 안 거치므로 영문 출력이 한글로 바뀌지 않고,
+    #      IME 모드를 건드리지 않아 "키워드 입력 전의 한/영 상태"가 그대로 보존됨.
+    #   ② Chromium 은 레거시 WM_IME_CONTROL(변환모드 제어)을 무시하므로,
+    #      스캔코드+IME강제 방식이 안 먹혀 입력이 아예 안 들어간다.
+    #      → 유니코드 직접 주입이라야 VSCode 터미널에 정상 입력된다.
+    _SCANCODE_WINDOW_CLASSES = {
+        "ConsoleWindowClass",            # 클래식 conhost: powershell.exe·cmd.exe 창
+        "CASCADIA_HOSTING_WINDOW_CLASS", # Windows Terminal
+        "mintty",                        # Git Bash·MSYS2·Cygwin
+        "VirtualConsoleClass",           # ConEmu·Cmder
+    }
+
+    def foreground_needs_scancode() -> bool:
+        """현재 포그라운드 창이 '콘솔 줄 편집기'라 스캔코드 주입이 필요한지.
+        콘솔이면 True(스캔코드+IME강제), 그 외 GUI/Electron 이면 False(유니코드).
+        알 수 없으면 False(유니코드) — 언어 보존·Chromium 호환을 기본으로."""
+        try:
+            hwnd = _GetForegroundWindow()
+            if not hwnd:
+                return False
+            cls = ctypes.create_unicode_buffer(256)
+            _GetClassNameW(hwnd, cls, 256)
+            return cls.value in _SCANCODE_WINDOW_CLASSES
+        except Exception:
+            return False
+
     # ── 단일 실행 보장 (named mutex) ──────────────────────────────
     # QSharedMemory 는 강제종료/크래시 시 잠금이 OS 에 남아(leak) 다음 실행을
     # 영구히 "이미 실행 중"으로 막는 문제가 있다. named mutex 는 소유 프로세스가
@@ -293,7 +333,8 @@ else:
         return False
 
     def send_text(text: str, char_delay: float = 0.01,
-                  case_guarantee: bool = True) -> bool:
+                  case_guarantee: bool = True,
+                  force_unicode: bool = False) -> bool:
         """비-Windows: 직접 주입 미지원. 호출자가 폴백 타이핑을 쓰도록 False 반환."""
         return False
 
@@ -305,6 +346,9 @@ else:
 
     def foreground_window_info() -> str:
         return "(non-win32)"
+
+    def foreground_needs_scancode() -> bool:
+        return False
 
     def acquire_single_instance(name=None):
         return False, None
@@ -1138,32 +1182,46 @@ class KeyboardListener(QObject):
             time.sleep(self._PRE_TYPE_DELAY)
             dbg("backspaces sent")
 
-            # 3) 새 텍스트는 스캔코드 키 이벤트로 직접 주입한다.
-            #    실제 키보드처럼 보내므로 GUI 앱뿐 아니라 PowerShell
-            #    PSReadLine·cmd·readline 같은 콘솔 줄 편집기도 정상 인식한다
-            #    (유니코드 주입은 콘솔 줄 편집기가 흘려버려 터미널에서 실패).
-            #    글자 단위로 순서대로 보내고 짧게 지연해 순서 꼬임을 막는다.
-            #    키보드로 칠 수 없는 글자(한글 등)는 send_text 내부에서
-            #    유니코드로 폴백한다. 클립보드는 건드리지 않는다.
+            # 3) 새 텍스트를 주입한다 — 대상 창 종류에 따라 방식을 나눈다.
             #
-            #    ※ 스캔코드는 활성 IME를 거치므로, 한글 입력 모드가 켜져
-            #      있으면 영문 출력이 한글로 바뀐다. 주입 동안만 IME를
-            #      영문(알파뉴메릭)으로 강제했다가 끝나면 원래대로 복원해,
-            #      출력 값이 한/영 상태와 무관하게 항상 그대로 들어가게 한다.
-            saved_ime = ime_force_alphanumeric()
-            dbg(f"ime_forced={bool(saved_ime)}")
-            try:
-                if saved_ime:
-                    # IME 모드 전환이 반영될 시간을 짧게 준다
-                    time.sleep(0.01)
-                ok = send_text(to_type, case_guarantee=self.case_guarantee)
-                dbg(f"send_text ok={ok} case_guarantee={self.case_guarantee}")
+            #    (A) 콘솔 줄 편집기(conhost·Windows Terminal·Git Bash 등):
+            #        스캔코드 키 이벤트로 보낸다(유니코드는 콘솔이 흘려버림).
+            #        스캔코드는 활성 IME를 거치므로, 한글 모드면 영문 출력이
+            #        한글로 바뀐다. 주입 동안만 IME를 영문으로 강제했다가
+            #        끝나면 원래대로 복원해 ① 출력이 항상 그대로 들어가고
+            #        ② 키워드 입력 전의 한/영 상태가 보존되게 한다.
+            #
+            #    (B) 일반 GUI·Electron/Chromium(VSCode 통합 터미널 등):
+            #        유니코드로 직접 주입한다. IME를 안 거치므로 영문 출력이
+            #        한글로 바뀌지 않고, IME 모드를 건드리지 않아 한/영 상태가
+            #        그대로 보존된다. (Chromium은 WM_IME_CONTROL을 무시해
+            #        스캔코드+IME강제 방식이 안 먹혀 입력이 아예 안 들어갔다.)
+            #
+            #    어느 쪽이든 줄바꿈/탭은 '진짜 키'로, 못 치는 글자(한글 등)는
+            #    유니코드로 처리된다. 클립보드는 건드리지 않는다.
+            if foreground_needs_scancode():
+                saved_ime = ime_force_alphanumeric()
+                dbg(f"inject via=scancode ime_forced={bool(saved_ime)}")
+                try:
+                    if saved_ime:
+                        # IME 모드 전환이 반영될 시간을 짧게 준다
+                        time.sleep(0.01)
+                    ok = send_text(to_type, case_guarantee=self.case_guarantee)
+                    dbg(f"send_text ok={ok} case_guarantee={self.case_guarantee}")
+                    if not ok:
+                        # 폴백: 비-Windows이거나 주입 실패 시 pynput 타이핑
+                        self.controller.type(to_type)
+                        dbg("fallback pynput type used")
+                finally:
+                    ime_restore(saved_ime)
+            else:
+                # 유니코드 직접 주입 (IME 미경유 → 언어 보존·Chromium 호환)
+                ok = send_text(to_type, case_guarantee=self.case_guarantee,
+                               force_unicode=True)
+                dbg(f"inject via=unicode ok={ok}")
                 if not ok:
-                    # 폴백: 비-Windows이거나 주입 실패 시 pynput 타이핑
                     self.controller.type(to_type)
                     dbg("fallback pynput type used")
-            finally:
-                ime_restore(saved_ime)
             time.sleep(self._POST_TYPE_DELAY)
             dbg(f"inject done trig={trigger!r}")
 
@@ -1199,7 +1257,7 @@ class RuleDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
 
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["word (단어)", "special (;단축어)", "regex (정규식)"])
+        self.type_combo.addItems(["special (;단축어)", "word (단어)", "regex (정규식)"])
         self.trigger_edit = QLineEdit()
         self.trigger_edit.setPlaceholderText("예: abc  또는  ;date  또는  \\d{4}")
         self.output_edit = QLineEdit()
@@ -1248,7 +1306,7 @@ class RuleDialog(QDialog):
         layout.addRow("", btn_row)
 
         if rule:
-            type_map = {"word": 0, "special": 1, "regex": 2}
+            type_map = {"special": 0, "word": 1, "regex": 2}
             self.type_combo.setCurrentIndex(type_map.get(rule["type"], 0))
             self.trigger_edit.setText(rule["trigger"])
             self.output_edit.setText(rule["output"])
@@ -1281,7 +1339,7 @@ class RuleDialog(QDialog):
             )
 
     def get_rule(self):
-        type_map = {0: "word", 1: "special", 2: "regex"}
+        type_map = {0: "special", 1: "word", 2: "regex"}
         return {
             "type":    type_map[self.type_combo.currentIndex()],
             "trigger": self.trigger_edit.text().strip(),
