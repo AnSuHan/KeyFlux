@@ -1429,7 +1429,7 @@ def make_app_icon() -> QIcon:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("KeyFlux")
+        self.setWindowTitle(f"KeyFlux v{APP_VERSION}")
         self.setMinimumSize(700, 540)
         self.setWindowIcon(make_app_icon())  # 창/작업표시줄 아이콘
         self.rules = load_rules()
@@ -1450,6 +1450,7 @@ class MainWindow(QMainWindow):
                       font-size: 13px; }
 
             QLabel#title    { font-size: 22px; font-weight: 700; color: #FFFFFF; letter-spacing: 1px; }
+            QLabel#version  { font-size: 12px; font-weight: 700; color: #9370DB; }
             QLabel#subtitle { font-size: 12px; color: #666; }
             QLabel#status_label { font-size: 12px; color: #888; }
 
@@ -1554,11 +1555,20 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         title_col = QVBoxLayout()
         title_col.setSpacing(2)
+        # 제목 + 버전 배지 (앱 내부에서 현재 버전 확인 가능)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
         t = QLabel("KeyFlux")
         t.setObjectName("title")
+        ver = QLabel(f"v{APP_VERSION}")
+        ver.setObjectName("version")
+        ver.setToolTip(f"KeyFlux 버전 {APP_VERSION}")
+        title_row.addWidget(t)
+        title_row.addWidget(ver, alignment=Qt.AlignmentFlag.AlignBottom)
+        title_row.addStretch()
         sub = QLabel("키 입력 자동 변환 · 백그라운드 실행")
         sub.setObjectName("subtitle")
-        title_col.addWidget(t)
+        title_col.addLayout(title_row)
         title_col.addWidget(sub)
 
         self.toggle_btn = QPushButton("● 활성화됨")
@@ -1730,12 +1740,17 @@ class MainWindow(QMainWindow):
 
     def _build_settings_dialog(self) -> QDialog:
         dlg = QDialog(self)
-        dlg.setWindowTitle("KeyFlux 설정")
+        dlg.setWindowTitle(f"KeyFlux 설정 (v{APP_VERSION})")
         dlg.setWindowIcon(make_app_icon())
         dlg.setMinimumWidth(420)
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(20, 18, 20, 16)
         lay.setSpacing(14)
+
+        # 버전 정보 (앱 내부에서 현재 버전 확인 가능)
+        ver_label = QLabel(f"KeyFlux v{APP_VERSION}")
+        ver_label.setStyleSheet("color: #9370DB; font-weight: 700; font-size: 13px;")
+        lay.addWidget(ver_label)
 
         match_box = QGroupBox("매칭 동작")
         mb = QVBoxLayout(match_box)
