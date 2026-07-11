@@ -459,6 +459,112 @@ class TestRuleDialogMultilineOutput(unittest.TestCase):
         self.assertEqual(d.get_rule()["trigger"], "ab")
 
 
+# ── 문장 중간에서 단축어 사용 시 앞 문맥(띄어쓰기/글자) 보존 ───────
+def _jamo_seq(word):
+    """완성형 한글 문자열을 사용자가 실제 누르는 자모 시퀀스로 분해."""
+    CHO = list("ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ")
+    JUNG = list("ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ")
+    JONG = [""] + list("ㄱㄲㄳㄴㄵㄶㄷㄹㄺㄻㄼㄽㄾㄿㅀㅁㅂㅄㅅㅆㅇㅈㅊㅋㅌㅍㅎ")
+    out = ""
+    for ch in word:
+        o = ord(ch)
+        if 0xAC00 <= o <= 0xD7A3:
+            c = o - 0xAC00
+            ci, rem = divmod(c, 21 * 28)
+            vi, ji = divmod(rem, 28)
+            out += CHO[ci] + JUNG[vi] + (JONG[ji] if ji else "")
+        else:
+            out += ch
+    return out
+
+
+class _ScreenSim:
+    """실제 _do_replace 를 태우되 주입 대신 (backspace 수, 주입 텍스트)만
+    잡아, '화면'을 compose_hangul(raw) 로 재구성해 치환 후 화면을 계산한다."""
+
+    def __init__(self, rule, normalize=True):
+        self.L = main.KeyboardListener()
+        self.L.set_normalize_mode(normalize)
+        self.L.set_rules([rule])
+        self.cap = {}
+
+        def fake_inject(trigger, to_type, resolved, bs):
+            self.cap.update(to_type=to_type, bs=bs)
+            self.L._replacing = False
+
+        self.L._inject_replacement = fake_inject
+        self.raw = ""
+
+    def type_jamo(self, s):
+        for ch in _jamo_seq(s):
+            self.raw += ch
+            self.L._on_press(_FakeCharKeyLike(ch))
+        return self
+
+    def finish(self, key):
+        self.raw += " " if key == "space" else "\n"
+        self.L._on_press(main.Key.space if key == "space" else main.Key.enter)
+        return self
+
+    def screen_after(self):
+        before = main.compose_hangul(self.raw)
+        if "bs" not in self.cap:
+            return None  # 발동 안 함
+        bs = self.cap["bs"]
+        head = before[:-bs] if bs <= len(before) else "@UNDERFLOW@"
+        return head + self.cap["to_type"]
+
+
+class _FakeCharKeyLike:
+    def __init__(self, c):
+        self.char = c
+
+
+class TestPrecedingContextPreserved(unittest.TestCase):
+    """문장 맨 앞이 아닌 위치에서 단축어를 써도 앞의 글자/띄어쓰기가
+    사라지지 않아야 한다(조합 경계 병합 과다삭제 버그 회귀 방지)."""
+
+    def test_space_preserved_word_english(self):
+        s = _ScreenSim({"type": "word", "trigger": "abc",
+                        "output": "OUT", "enabled": True})
+        s.type_jamo("hi ").type_jamo("abc").finish("space")
+        self.assertEqual(s.screen_after(), "hi OUT ")
+
+    def test_space_preserved_special_korean(self):
+        s = _ScreenSim({"type": "special", "trigger": ";;안녕",
+                        "output": "OUT", "enabled": True})
+        s.type_jamo("테스트 ").type_jamo(";;안녕")
+        self.assertEqual(s.screen_after(), "테스트 OUT")
+
+    def test_space_preserved_cross_mode(self):
+        # 한글모드로 영문 트리거(abc) 입력(ㅁㅠㅊ→뮻), 앞 문맥 보존
+        s = _ScreenSim({"type": "word", "trigger": "abc",
+                        "output": "OUT", "enabled": True})
+        s.type_jamo("안녕 ").type_jamo("ㅁㅠㅊ").finish("space")
+        self.assertEqual(s.screen_after(), "안녕 OUT ")
+
+    def test_boundary_merge_preserves_preceding_char(self):
+        # 앞 글자 "가"(받침 없음) 뒤에 첫 자음이 받침으로 합쳐지는 트리거
+        # "ㄴ;x" → 화면 "간;x". 종전엔 "가"까지 지워졌으나, 이제 복원돼야 함.
+        s = _ScreenSim({"type": "special", "trigger": "ㄴ;x",
+                        "output": "OUT", "enabled": True})
+        s.type_jamo("가").type_jamo("ㄴ;x")
+        self.assertEqual(s.screen_after(), "가OUT")
+
+    def test_boundary_merge_with_space_unaffected(self):
+        # 앞에 공백이 있으면 병합이 없으므로 그대로 정상
+        s = _ScreenSim({"type": "special", "trigger": "ㄴ;x",
+                        "output": "OUT", "enabled": True})
+        s.type_jamo("가 ").type_jamo("ㄴ;x")
+        self.assertEqual(s.screen_after(), "가 OUT")
+
+    def test_shortcut_at_start_still_works(self):
+        s = _ScreenSim({"type": "special", "trigger": ";date",
+                        "output": "OUT", "enabled": True})
+        s.type_jamo(";date")
+        self.assertEqual(s.screen_after(), "OUT")
+
+
 # ── 변환(치환) 중 사용자 실입력 전역 차단 판단 ────────────────────
 class _FakeHookData:
     """pynput 저수준 후크의 _KBDLLHOOKSTRUCT 를 흉내내는 가짜 데이터."""

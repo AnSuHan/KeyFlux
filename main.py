@@ -1125,15 +1125,23 @@ class KeyboardListener(QObject):
 
     def _do_replace_norm(self, trigger: str, output: str, k: int, extra: str = ""):
         """정규화(한/영·대소문자 무관) 매칭 결과 치환.
-        buffer 의 마지막 k 글자가 트리거에 해당하므로, 화면에 보이는
-        글자 수는 그 부분을 조합한 길이로 계산한다(한글이면 음절 수)."""
-        matched_raw = self.buffer[-k:]
-        visible = len(compose_hangul(matched_raw)) or k
-        self._do_replace(trigger, output, extra=extra, via="norm",
-                         visible_chars=visible)
+        buffer 의 마지막 k 글자가 트리거에 해당하므로, 그 글자 수(k)를
+        consumed_raw 로 넘겨 _do_replace 가 화면상 실제 보이는 길이를
+        정확히 계산하게 한다(조합 경계 병합까지 보정)."""
+        self._do_replace(trigger, output, extra=extra, via="norm", consumed_raw=k)
+
+    def _consumed_raw_for(self, trigger: str) -> int:
+        """composed 매칭에서 트리거가 버퍼(원본 자모)에서 차지하는 글자 수.
+        버퍼 끝에서 j글자를 조합했을 때 트리거와 정확히 같아지는 최소 j 를
+        찾는다(영문/숫자는 j=len(trigger)). 못 찾으면 트리거 조합 길이로 폴백."""
+        buf = self.buffer
+        for j in range(1, len(buf) + 1):
+            if compose_hangul(buf[-j:]) == trigger:
+                return j
+        return len(compose_hangul(trigger)) or len(trigger)
 
     def _do_replace(self, trigger: str, output: str, extra: str = "",
-                    via: str = "composed", visible_chars: int = None):
+                    via: str = "composed", consumed_raw: int = None):
         # 재귀/중첩 호출 방어: 이전 치환의 입력 주입이 아직 진행 중이면 무시
         if self._replacing:
             dbg(f"REPLACE skipped (busy) trig={trigger!r}")
@@ -1141,30 +1149,36 @@ class KeyboardListener(QObject):
         self._replacing = True
 
         resolved = resolve_output(output)
-        to_type = resolved + extra
 
-        # 화면에서 지워야 할 "보이는 글자 수"를 계산한다.
-        # - via="raw": 트리거 자체가 그대로 입력/표시된 경우 (영문/숫자 등)
-        #              → 글자 수 = len(trigger)
-        # - via="norm": 한/영·대소문자 무관 매칭. 실제 화면에 찍힌 글자 수가
-        #              트리거와 다를 수 있어(예: 영문 트리거를 한글 모드로 입력)
-        #              호출자가 계산한 visible_chars 를 그대로 쓴다.
-        # - via="composed": 트리거가 한글 자모 조합 결과로 매칭된 경우
-        #              → 화면에는 조합된 형태(compose_hangul(trigger))로
-        #                보이므로, 그 길이만큼만 백스페이스하면 됨
-        #                (한글 1글자 = 백스페이스 1번, 자모 개수와 무관)
-        if via == "raw":
-            trigger_backspaces = len(trigger)
-        elif visible_chars is not None:
-            trigger_backspaces = visible_chars
-        else:
-            trigger_backspaces = len(compose_hangul(trigger)) or len(trigger)
+        # ── 트리거가 버퍼에서 차지하는 '원본(raw) 글자 수' 결정 ────────────
+        #   - raw       : 트리거가 입력 그대로이므로 len(trigger)
+        #   - norm       : 호출자(_do_replace_norm)가 넘긴 k
+        #   - composed   : 끝에서 조합해 트리거와 같아지는 최소 글자 수
+        if consumed_raw is None:
+            consumed_raw = len(trigger) if via == "raw" else self._consumed_raw_for(trigger)
+        consumed_raw = max(0, min(consumed_raw, len(self.buffer)))
+
+        # ── 화면(조합형) 기준으로 실제 지워야 할 글자 수를 정확히 계산 ──────
+        # 트리거를 치기 '전' 화면(before)과 '후' 화면(after)을 비교한다.
+        # 보통은 트리거가 새로 추가한 글자 수만 지우면 되지만, 한글 조합 경계에서
+        # 트리거의 첫 자모가 앞 글자와 합쳐진 경우(예: "가"+ㄴ→"간")에는 그
+        # 합쳐진 앞 글자까지 함께 지워진다(=문장 중간에서 단축어를 쓰면 앞의
+        # 글자/띄어쓰기가 사라지던 버그). 그럴 땐 지운 뒤 그 앞 글자를 다시
+        # 찍어(reinject) 복원한다. 병합이 없으면 reinject 는 "" 이라 종전과 동일.
+        after = self.composed  # == compose_hangul(self.buffer) (extra 미포함)
+        before = compose_hangul(self.buffer[:-consumed_raw]) if consumed_raw else after
+        cp = 0
+        m = min(len(before), len(after))
+        while cp < m and before[cp] == after[cp]:
+            cp += 1
+        reinject = before[cp:]           # 경계 병합으로 함께 지워질 앞 글자(보통 "")
+        trigger_backspaces = len(after) - cp
+
+        to_type = reinject + resolved + extra
 
         # extra(스페이스/엔터)는 word/regex 트리거를 완성시킨 "그 키 입력"인데,
         # suppress=False라 이미 화면에 정상적으로 찍혀 있는 상태다.
-        # 즉 백스페이스 시점의 화면 = trigger 부분 + extra 1글자.
-        # 이걸 빼놓으면 trigger의 첫 글자가 안 지워지고 남는다
-        # (예: "abc"+스페이스 → 3번만 지우면 "a123 "이 됨. 4번 지워야 "123 ").
+        # 즉 백스페이스 시점의 화면 = (트리거+병합 앞글자) + extra 1글자.
         backspace_count = trigger_backspaces + len(extra)
 
         # 실제 입력 주입(백스페이스+붙여넣기)에 걸릴 예상 시간을 계산해
@@ -1181,21 +1195,17 @@ class KeyboardListener(QObject):
         duration = max(self._SUPPRESS_MIN, min(self._SUPPRESS_MAX, est))
         self._suppress_until = time.monotonic() + duration
 
-        # 버퍼는 즉시(동기적으로) 갱신 → 이후 들어오는 키 입력은
-        # 올바른 버퍼 상태를 기준으로 처리됨.
-        if via == "raw" and trigger and self.buffer.endswith(trigger):
-            # 분리형 매칭: 트리거가 입력 그대로이므로 정확히 잘라낼 수 있음
-            self.buffer = self.buffer[:-len(trigger)] + to_type
-        else:
-            # 조합형 매칭: 트리거 이전의 원본 자모 시퀀스를 정확히
-            # 역산하기 어려우므로(받침 재구성 등), 버퍼를 결과 텍스트
-            # 기준으로 재설정한다. (compose_hangul(to_type) == to_type
-            # 이므로 이후 입력에 영향 없음)
-            self.buffer = to_type
+        # 버퍼는 즉시(동기적으로) 갱신 → 이후 들어오는 키 입력은 올바른 버퍼
+        # 상태를 기준으로 처리됨. 화면과 동일하게 "앞 문맥(before[:cp]) + 출력"
+        # 으로 맞춘다. before[:cp] + to_type == before + resolved + extra 이므로
+        # 앞 문맥이 그대로 보존된다(종전엔 조합형에서 앞 문맥을 버려 버퍼가
+        # 화면과 어긋났음).
+        self.buffer = before[:cp] + to_type
         self.composed = compose_hangul(self.buffer)
 
-        dbg(f"REPLACE trig={trigger!r} via={via} bs={backspace_count} "
-            f"to_type={to_type!r} fg={foreground_window_info()}")
+        dbg(f"REPLACE trig={trigger!r} via={via} cr={consumed_raw} "
+            f"bs={backspace_count} reinject={reinject!r} to_type={to_type!r} "
+            f"fg={foreground_window_info()}")
 
         # 실제 키 입력 주입은 백그라운드 스레드에서 처리한다.
         # 1) 후킹 콜백을 즉시 반환시켜 다른 키 입력을 막지(블로킹) 않음
