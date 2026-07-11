@@ -427,5 +427,108 @@ class TestRuleDialogTypeOrder(unittest.TestCase):
             self.assertEqual(d.get_rule()["type"], t)
 
 
+# ── 규칙 다이얼로그: 출력에 줄바꿈(Enter) 포함 저장 ────────────────
+class TestRuleDialogMultilineOutput(unittest.TestCase):
+    """출력 필드가 다중 줄이 되어, Enter(줄바꿈)를 담은 출력을 저장하면
+    앞뒤 줄바꿈까지 그대로 보존되는지 검증(트리거는 여전히 strip)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_multiline_output_roundtrip(self):
+        d = main.RuleDialog(rule={
+            "type": "word", "trigger": "sig",
+            "output": "line1\nline2\n", "enabled": True})
+        r = d.get_rule()
+        self.assertEqual(r["output"], "line1\nline2\n")  # 후행 줄바꿈까지 보존
+        self.assertEqual(r["trigger"], "sig")
+
+    def test_output_not_stripped(self):
+        # 앞뒤 공백/줄바꿈이 있는 출력은 그대로 저장(strip 하지 않음).
+        d = main.RuleDialog(rule={
+            "type": "word", "trigger": "t",
+            "output": "\n  hi  \n", "enabled": True})
+        self.assertEqual(d.get_rule()["output"], "\n  hi  \n")
+
+    def test_trigger_still_stripped(self):
+        d = main.RuleDialog(rule={
+            "type": "word", "trigger": "  ab ",
+            "output": "x", "enabled": True})
+        self.assertEqual(d.get_rule()["trigger"], "ab")
+
+
+# ── 변환(치환) 중 사용자 실입력 전역 차단 판단 ────────────────────
+class _FakeHookData:
+    """pynput 저수준 후크의 _KBDLLHOOKSTRUCT 를 흉내내는 가짜 데이터."""
+    def __init__(self, flags, vk=8):
+        self.flags = flags
+        self.vkCode = vk
+
+
+class TestBlockingDuringReplace(unittest.TestCase):
+    """_blocking_now: '변환 진행 중 + 사용자 실입력' 일 때만 True.
+    (한/영·Enter·Backspace 등을 변환 중에만 전역 차단하는 판단 로직)"""
+
+    def _listener(self):
+        L = main.KeyboardListener()
+        L.active = True
+        L._replacing = False
+        L._suppress_until = 0.0
+        return L
+
+    def test_block_user_key_while_replacing(self):
+        L = self._listener()
+        L._replacing = True
+        self.assertTrue(L._blocking_now(_FakeHookData(0x00)))
+
+    def test_pass_injected_event_while_replacing(self):
+        # 우리 주입 이벤트(LLKHF_INJECTED)는 변환 중이라도 통과해야 치환이 진행됨
+        L = self._listener()
+        L._replacing = True
+        inj = main.KeyboardListener._LLKHF_INJECTED
+        self.assertFalse(L._blocking_now(_FakeHookData(inj)))
+
+    def test_block_within_suppress_window(self):
+        import time
+        L = self._listener()
+        L._suppress_until = time.monotonic() + 5
+        self.assertTrue(L._blocking_now(_FakeHookData(0x00)))
+
+    def test_no_block_when_idle(self):
+        # 변환을 하지 않는 평상시엔 사용자 키도 차단하지 않음
+        L = self._listener()
+        self.assertFalse(L._blocking_now(_FakeHookData(0x00)))
+
+    def test_no_block_when_inactive(self):
+        L = self._listener()
+        L._replacing = True
+        L.active = False
+        self.assertFalse(L._blocking_now(_FakeHookData(0x00)))
+
+    def test_filter_suppresses_only_when_blocking(self):
+        # win32_event_filter 는 차단 대상일 때만 suppress_event() 를 부른다.
+        L = self._listener()
+        calls = []
+
+        class _StubListener:
+            def suppress_event(self):
+                calls.append(True)
+                raise RuntimeError("suppressed")  # 실제 pynput 도 예외를 던짐
+
+        L._listener = _StubListener()
+
+        # 유휴 상태: 차단 안 함 → suppress_event 호출 없음, 정상 반환
+        self.assertTrue(L._win32_event_filter(0x0100, _FakeHookData(0x00)))
+        self.assertEqual(calls, [])
+
+        # 변환 중 + 사용자 실입력: suppress_event 호출 → 예외 전파(차단)
+        L._replacing = True
+        with self.assertRaises(RuntimeError):
+            L._win32_event_filter(0x0100, _FakeHookData(0x00))
+        self.assertEqual(calls, [True])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

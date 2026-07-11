@@ -13,10 +13,10 @@ from PyQt6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem, QLabel, QLineEdit,
     QDialog, QFormLayout, QComboBox, QMessageBox, QSystemTrayIcon,
     QMenu, QHeaderView, QFrame, QCheckBox, QFileDialog, QGroupBox,
-    QDialogButtonBox
+    QDialogButtonBox, QPlainTextEdit
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
-from PyQt6.QtGui import QIcon, QColor, QFont, QPixmap, QPainter
+from PyQt6.QtGui import QIcon, QColor, QFont, QPixmap, QPainter, QKeySequence, QShortcut
 from pynput import keyboard
 from pynput.keyboard import Key, Controller
 import ctypes
@@ -1270,13 +1270,61 @@ class KeyboardListener(QObject):
         finally:
             self._replacing = False
 
+    # Windows 저수준 후크 플래그: 이 키 이벤트가 SendInput 등으로 "주입"된
+    # 것임을 나타낸다. 우리 치환 주입(백스페이스·유니코드/스캔코드 텍스트)은
+    # 이 플래그가 서 있으므로, 변환 중 전역 차단에서 반드시 제외해야
+    # 치환이 스스로 막히지 않는다.
+    _LLKHF_INJECTED = 0x10
+
+    def _blocking_now(self, data) -> bool:
+        """지금 이 키 이벤트를 전역 차단해야 하는지 판단.
+        조건: (1) 리스너 활성 + (2) '키워드 → 출력' 치환이 진행 중 +
+              (3) 사용자의 '실제' 입력(우리가 주입한 이벤트가 아님).
+        치환 진행 창 = 주입 스레드 실행 중(_replacing) 또는 억제 시간 이내
+        (_suppress_until). 셋 다 만족할 때만 True."""
+        if not self.active:
+            return False
+        if not (self._replacing or time.monotonic() < self._suppress_until):
+            return False
+        try:
+            if data.flags & self._LLKHF_INJECTED:
+                return False  # 우리(또는 시스템) 주입 이벤트 → 통과시켜 치환 진행
+        except Exception:
+            return False
+        dbg(f"BLOCK user key during replace vk={getattr(data, 'vkCode', '?')} "
+            f"flags={getattr(data, 'flags', 0):#x}")
+        return True
+
+    def _win32_event_filter(self, msg, data):
+        """Windows 저수준 키보드 후크 필터(모든 키 이벤트마다 후크 스레드에서 호출).
+        평상시엔 아무 것도 건드리지 않는다. 단 '키워드 → 출력' 치환이 주입되는
+        짧은 동안에는, 사용자의 실제 키 입력(한/영·Enter·Backspace 등)을
+        시스템 전역으로 차단해 진행 중인 치환이 사용자 입력과 뒤섞여 깨지지
+        않게 한다. 변환이 끝나면(_replacing 해제 + _suppress_until 만료)
+        즉시 차단이 풀린다.
+        차단은 suppress_event() 가 일으키는 SuppressException 으로 이뤄지며,
+        그 예외는 pynput 후크(SystemHook)가 잡아 CallNextHookEx 를 호출하지
+        않게 해(=return 1) 이벤트가 대상 앱/시스템으로 전파되지 못하게 한다.
+        (그래서 여기서 그 예외를 잡으면 안 된다.)"""
+        if self._blocking_now(data):
+            self._listener.suppress_event()
+        return True
+
     def start(self):
-        # suppress=False (기본값) : 모든 키 이벤트를 가로채거나 차단하지 않고
-        # 그대로 OS/대상 앱에 전달한다. 이 리스너는 "관찰"만 하며,
-        # 등록된 트리거가 완성됐을 때만 백스페이스+재입력으로 치환한다.
+        # 평상시(suppress=False): 모든 키 이벤트를 가로채거나 차단하지 않고
+        # 그대로 OS/대상 앱에 전달한다. 리스너는 "관찰"만 하며, 등록된
+        # 트리거가 완성됐을 때만 백스페이스+재입력으로 치환한다.
+        # 예외: 치환이 주입되는 짧은 동안에는 win32_event_filter 에서
+        # 사용자 실입력만 골라 전역 차단하고(우리 주입 이벤트는 통과),
+        # 변환이 끝나면 차단을 즉시 해제한다.
         dbg(f"listener started normalize_mode={self.normalize_mode} "
             f"rules={len(self.rules)}")
-        self._listener = keyboard.Listener(on_press=self._on_press, suppress=False)
+        kwargs = dict(on_press=self._on_press, suppress=False)
+        if sys.platform == "win32":
+            # win32_event_filter → pynput 내부에서 'win32_' 접두사가 제거되어
+            # 저수준 후크의 이벤트 필터로 등록된다.
+            kwargs["win32_event_filter"] = self._win32_event_filter
+        self._listener = keyboard.Listener(**kwargs)
         self._listener.start()
 
     def stop(self):
@@ -1290,7 +1338,7 @@ class RuleDialog(QDialog):
     def __init__(self, parent=None, rule=None):
         super().__init__(parent)
         self.setWindowTitle("규칙 편집" if rule else "규칙 추가")
-        self.setFixedSize(420, 320)
+        self.setFixedSize(420, 400)
         self.setStyleSheet(parent.styleSheet() if parent else "")
 
         layout = QFormLayout(self)
@@ -1301,8 +1349,17 @@ class RuleDialog(QDialog):
         self.type_combo.addItems(["special (;단축어)", "word (단어)", "regex (정규식)"])
         self.trigger_edit = QLineEdit()
         self.trigger_edit.setPlaceholderText("예: abc  또는  ;date  또는  \\d{4}")
-        self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("예: 123  또는  {date}  또는  [DATE]")
+        # 출력은 여러 줄(줄바꿈 포함)을 담을 수 있도록 다중 줄 입력을 쓴다.
+        # Enter 를 누르면 줄바꿈이 들어가고, 저장된 줄바꿈은 치환 시 실제
+        # Enter 키로 주입된다(send_text 의 "\n" 처리). 저장은 "저장" 버튼
+        # 또는 Ctrl+Enter 로 한다(아래 단축키 참조).
+        self.output_edit = QPlainTextEdit()
+        self.output_edit.setPlaceholderText(
+            "예: 123  또는  {date}  또는  [DATE]\n(Enter 로 줄바꿈, Ctrl+Enter 로 저장)")
+        self.output_edit.setFixedHeight(90)
+        # Tab 은 필드 이동(다음 위젯)으로 쓰이도록 탭 입력을 막지 않되,
+        # 여러 줄 편집기의 기본 Tab(탭 문자 삽입)을 유지한다.
+        self.output_edit.setTabChangesFocus(True)
 
         layout.addRow("타입",   self.type_combo)
         layout.addRow("트리거", self.trigger_edit)
@@ -1323,10 +1380,18 @@ class RuleDialog(QDialog):
         self.output_edit.textChanged.connect(self._update_preview)
         self._update_preview()
 
+        # 출력 필드에 포커스가 있을 때 Enter 는 줄바꿈이므로, 키보드로
+        # 저장하려면 Ctrl+Enter 를 쓴다(다이얼로그 전체에 걸리는 단축키).
+        save_sc = QShortcut(QKeySequence("Ctrl+Return"), self)
+        save_sc.activated.connect(self.accept)
+        save_sc2 = QShortcut(QKeySequence("Ctrl+Enter"), self)
+        save_sc2.activated.connect(self.accept)
+
         hint = QLabel(
             "특수 변수: {date} {time} {datetime}\n"
             "형식 지정: {date:%Y%m%d} → 20260613   {time:%H:%M} → 20:03\n"
-            "           {date:%m-%d} → 06-13"
+            "           {date:%m-%d} → 06-13\n"
+            "출력에 Enter 로 줄바꿈 포함 가능 · Ctrl+Enter 로 저장"
         )
         hint.setStyleSheet("color: #888; font-size: 11px;")
         layout.addRow("", hint)
@@ -1334,8 +1399,9 @@ class RuleDialog(QDialog):
         btn_row = QHBoxLayout()
         ok_btn     = QPushButton("저장")
         ok_btn.clicked.connect(self.accept)
-        # Enter(Return) 로 저장되도록 "저장" 버튼을 기본 버튼으로 지정.
-        # (QLineEdit 에서 Enter 를 누르면 다이얼로그의 기본 버튼이 눌림)
+        # 트리거(QLineEdit)에 포커스가 있을 때 Enter 로 저장되도록 "저장"
+        # 버튼을 기본 버튼으로 지정. (출력 필드는 다중 줄이라 Enter 가
+        # 줄바꿈으로 들어가므로, 출력 편집 중에는 Ctrl+Enter 로 저장한다.)
         ok_btn.setDefault(True)
         ok_btn.setAutoDefault(True)
         cancel_btn = QPushButton("취소")
@@ -1350,11 +1416,11 @@ class RuleDialog(QDialog):
             type_map = {"special": 0, "word": 1, "regex": 2}
             self.type_combo.setCurrentIndex(type_map.get(rule["type"], 0))
             self.trigger_edit.setText(rule["trigger"])
-            self.output_edit.setText(rule["output"])
+            self.output_edit.setPlainText(rule["output"])
             self._update_preview()
 
     def _update_preview(self):
-        text = self.output_edit.text()
+        text = self.output_edit.toPlainText()
         if not text:
             self.preview_label.setText("(출력 내용을 입력하세요)")
             self.preview_label.setStyleSheet(
@@ -1384,7 +1450,9 @@ class RuleDialog(QDialog):
         return {
             "type":    type_map[self.type_combo.currentIndex()],
             "trigger": self.trigger_edit.text().strip(),
-            "output":  self.output_edit.text().strip(),
+            # 출력은 줄바꿈(Enter)을 의도적으로 담을 수 있으므로 strip 하지
+            # 않는다(앞뒤 줄바꿈/들여쓰기까지 저장·주입 그대로 보존).
+            "output":  self.output_edit.toPlainText(),
             "enabled": True,
         }
 
@@ -1531,10 +1599,10 @@ class MainWindow(QMainWindow):
                 font-size: 11px; letter-spacing: 1px;
                 border: none; border-bottom: 1px solid #252840; padding: 8px 10px; }
 
-            QLineEdit {
+            QLineEdit, QPlainTextEdit {
                 background: #141620; border: 1px solid #252840;
                 border-radius: 6px; padding: 7px 10px; color: #E8E8F0; }
-            QLineEdit:focus { border-color: #7C5CBF; }
+            QLineEdit:focus, QPlainTextEdit:focus { border-color: #7C5CBF; }
 
             QComboBox {
                 background: #141620; border: 1px solid #252840;
