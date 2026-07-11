@@ -85,8 +85,79 @@ class TestResolveOutput(unittest.TestCase):
         self.assertTrue(out.isdigit())
 
     def test_invalid_format_kept(self):
-        # 잘못된(존재하지 않는) 형식은 원본을 보존
+        # 미해석(정의 안 된) 키는 원본을 보존
         self.assertEqual(main.resolve_output("{nope}"), "{nope}")
+
+    # ── 위치 인자 ──────────────────────────────────────────────
+    def test_positional_args(self):
+        self.assertEqual(
+            main.resolve_output("{1} {2}", args=["가", "나"]), "가 나")
+
+    def test_positional_arg_missing_is_empty(self):
+        self.assertEqual(main.resolve_output("[{1}]", args=[]), "[]")
+
+    def test_positional_arg_default(self):
+        # 인자가 없으면 콜론 뒤 기본값 사용
+        self.assertEqual(main.resolve_output("{1:없음}", args=[]), "없음")
+        # 인자가 있으면 기본값 무시
+        self.assertEqual(main.resolve_output("{1:없음}", args=["값"]), "값")
+
+    def test_star_all_args_preserves_spaces(self):
+        self.assertEqual(
+            main.resolve_output("{*}", args=["a", "b"], args_all="a  b"),
+            "a  b")
+
+    def test_star_defaults_to_joined_args(self):
+        self.assertEqual(main.resolve_output("{*}", args=["a", "b"]), "a b")
+
+    # ── 재사용 변수 ────────────────────────────────────────────
+    def test_variable_substitution(self):
+        self.assertEqual(
+            main.resolve_output("{회사} 드림", variables={"회사": "한빛"}),
+            "한빛 드림")
+
+    def test_unknown_variable_kept(self):
+        self.assertEqual(main.resolve_output("{없는변수}"), "{없는변수}")
+
+    def test_mixed_date_arg_variable(self):
+        out = main.resolve_output(
+            "{회사} {1} {date:%Y}", args=["홍길동"], variables={"회사": "한빛"})
+        self.assertTrue(out.startswith("한빛 홍길동 "))
+
+    # ── 이스케이프 ─────────────────────────────────────────────
+    def test_literal_braces(self):
+        self.assertEqual(main.resolve_output("{{1}}"), "{1}")
+        self.assertEqual(
+            main.resolve_output("{{회사}}", variables={"회사": "한빛"}),
+            "{회사}")
+
+    def test_backward_compatible_no_args(self):
+        # args/variables 를 안 넘기면 날짜/시간만 처리(기존 동작)
+        self.assertEqual(main.resolve_output("plain {1}"), "plain ")
+
+
+# ── 파라미터 규칙 감지 & 변수명 검증 ───────────────────────────────
+class TestParamDetectionAndVarNames(unittest.TestCase):
+    def test_output_is_parameterized(self):
+        self.assertTrue(main.output_is_parameterized("{1}"))
+        self.assertTrue(main.output_is_parameterized("hi {2} there"))
+        self.assertTrue(main.output_is_parameterized("{*}"))
+        self.assertTrue(main.output_is_parameterized("{1:기본}"))
+
+    def test_not_parameterized(self):
+        self.assertFalse(main.output_is_parameterized("{date}"))
+        self.assertFalse(main.output_is_parameterized("{회사}"))
+        self.assertFalse(main.output_is_parameterized("plain"))
+        # 이스케이프된 중괄호는 인자가 아님
+        self.assertFalse(main.output_is_parameterized("{{1}}"))
+
+    def test_valid_variable_names(self):
+        for name in ("회사", "name", "user_id", "a1"):
+            self.assertEqual(main.validate_variable_name(name), "")
+
+    def test_invalid_variable_names(self):
+        for name in ("", "123", "*", "date", "time", "datetime", "a:b", "x{y"):
+            self.assertNotEqual(main.validate_variable_name(name), "")
 
 
 # ── ';;' 우선 정렬 ─────────────────────────────────────────────────
@@ -125,7 +196,7 @@ class ListenerHarness:
         self.listener.set_rules(rules)
 
     def _fake_replace(self, trigger, output, extra="", via="composed",
-                      visible_chars=None):
+                      **kwargs):
         self.events.append(("fire", trigger, extra, via))
         self.listener.buffer = main.resolve_output(output) + extra
         self.listener.composed = main.compose_hangul(self.listener.buffer)
@@ -563,6 +634,107 @@ class TestPrecedingContextPreserved(unittest.TestCase):
                         "output": "OUT", "enabled": True})
         s.type_jamo(";date")
         self.assertEqual(s.screen_after(), "OUT")
+
+
+# ── 인라인 인자 캡처(파라미터 규칙) 통합 ─────────────────────────
+class TestInlineArgCapture(unittest.TestCase):
+    """파라미터 규칙: 트리거 뒤 공백으로 인자 입력 → Enter 확정 → 치환.
+    실제 _do_replace 를 태워 화면(스크린 모델) 결과를 검증한다."""
+
+    def _sim(self, output, normalize=True):
+        return _ScreenSim({"type": "special", "trigger": ";메일",
+                           "output": output, "enabled": True}, normalize)
+
+    def test_positional_arg_capture(self):
+        s = self._sim("{1} 님께")
+        s.type_jamo(";메일").type_jamo(" 홍길동").finish("enter")
+        self.assertEqual(s.screen_after(), "홍길동 님께")
+
+    def test_capture_preserves_preceding_context(self):
+        s = self._sim("{1} 님께")
+        s.type_jamo("안녕 ").type_jamo(";메일").type_jamo(" 홍길동").finish("enter")
+        self.assertEqual(s.screen_after(), "안녕 홍길동 님께")
+
+    def test_star_captures_all_args(self):
+        s = self._sim("[{*}]")
+        s.type_jamo(";메일").type_jamo(" a b c").finish("enter")
+        self.assertEqual(s.screen_after(), "[a b c]")
+
+    def test_multiple_positional_args(self):
+        s = self._sim("{2}-{1}")
+        s.type_jamo(";메일").type_jamo(" a b").finish("enter")
+        self.assertEqual(s.screen_after(), "b-a")
+
+    def test_empty_args_enter_immediately_uses_default(self):
+        s = self._sim("{1:없음}")
+        s.type_jamo(";메일").finish("enter")
+        self.assertEqual(s.screen_after(), "없음")
+
+    def test_variable_in_capture_output(self):
+        s = self._sim("{회사} {1} 드림")
+        s.L.set_variables({"회사": "한빛"})
+        s.type_jamo(";메일").type_jamo(" 홍길동").finish("enter")
+        self.assertEqual(s.screen_after(), "한빛 홍길동 드림")
+
+
+class TestVariableInStaticRule(unittest.TestCase):
+    """파라미터가 없는 일반 규칙이라도 {이름} 변수는 즉시 치환된다."""
+
+    def test_static_variable_substitution(self):
+        s = _ScreenSim({"type": "special", "trigger": ";회사",
+                        "output": "{회사}", "enabled": True})
+        s.L.set_variables({"회사": "한빛"})
+        s.type_jamo(";회사")
+        self.assertEqual(s.screen_after(), "한빛")
+
+
+class TestCaptureStateMachine(unittest.TestCase):
+    """캡처 진입/취소 등 상태 전이 검증(주입은 가짜로 대체)."""
+
+    def _L(self, output="{1}"):
+        L = main.KeyboardListener()
+        L._inject_replacement = lambda *a, **k: setattr(L, "_replacing", False)
+        L.set_rules([{"type": "special", "trigger": ";x",
+                      "output": output, "enabled": True}])
+        return L
+
+    def _type(self, L, s):
+        for ch in s:
+            L._on_press(_FakeCharKey(ch))
+
+    def test_enters_capture_on_param_trigger(self):
+        L = self._L("{1}")
+        self._type(L, ";x")
+        self.assertIsNotNone(L._capturing)
+
+    def test_no_capture_for_static_trigger(self):
+        L = self._L("정적출력")
+        self._type(L, ";x")
+        self.assertIsNone(L._capturing)
+
+    def test_backspace_past_trigger_cancels(self):
+        L = self._L("{1}")
+        self._type(L, ";x")
+        L._on_press(main.Key.backspace)  # 트리거 밖으로 지움 → 취소
+        self.assertIsNone(L._capturing)
+
+    def test_esc_cancels_capture(self):
+        L = self._L("{1}")
+        self._type(L, ";x")
+        L._on_press(main.Key.esc)
+        self.assertIsNone(L._capturing)
+
+    def test_args_too_long_cancels(self):
+        L = self._L("{1}")
+        self._type(L, ";x")
+        self._type(L, "a" * (L._CAPTURE_MAX_ARGS + 5))
+        self.assertIsNone(L._capturing)
+
+    def test_deactivate_clears_capture(self):
+        L = self._L("{1}")
+        self._type(L, ";x")
+        L.set_active(False)
+        self.assertIsNone(L._capturing)
 
 
 # ── 변환(치환) 중 사용자 실입력 전역 차단 판단 ────────────────────

@@ -29,6 +29,8 @@ wheels/
 rules.json
 keyflux_settings.json
 .keyflux_settings.json
+keyflux_variables.json
+.keyflux_variables.json
 
 # ===== 테스트/커버리지 =====
 .pytest_cache/

@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem, QLabel, QLineEdit,
     QDialog, QFormLayout, QComboBox, QMessageBox, QSystemTrayIcon,
     QMenu, QHeaderView, QFrame, QCheckBox, QFileDialog, QGroupBox,
-    QDialogButtonBox, QPlainTextEdit
+    QDialogButtonBox, QPlainTextEdit, QTextBrowser
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QIcon, QColor, QFont, QPixmap, QPainter, QKeySequence, QShortcut
@@ -22,7 +22,7 @@ from pynput.keyboard import Key, Controller
 import ctypes
 
 # 앱 버전 (SemVer). 릴리스 태그 v<버전> 과 일치시킨다.
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 
 
 # ── 유니코드 직접 주입 (Windows SendInput) ───────────────────────
@@ -435,6 +435,59 @@ def save_settings(settings):
     except Exception:
         pass
 
+# ── 재사용 변수 저장/불러오기 ─────────────────────────────────────
+# 출력에서 {이름} 으로 참조하는 재사용 변수({"회사":"한빛", ...})를 규칙 파일
+# 옆 keyflux_variables.json 에 보관한다(SETTINGS_FILE 과 같은 패턴).
+VARIABLES_FILE = DATA_FILE.parent / (
+    "keyflux_variables.json" if DATA_FILE.name == "rules.json"
+    else ".keyflux_variables.json"
+)
+
+# 변수명으로 쓸 수 없는 예약어(플레이스홀더 키와 충돌).
+_RESERVED_VAR_NAMES = {"date", "time", "datetime"}
+
+
+def load_variables() -> dict:
+    if VARIABLES_FILE.exists():
+        try:
+            with open(VARIABLES_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                # 키/값을 문자열로 정규화(JSON 이 숫자로 저장된 경우 대비)
+                return {str(k): str(v) for k, v in loaded.items()}
+        except Exception:
+            pass
+    return {}
+
+
+def save_variables(variables: dict):
+    try:
+        with open(VARIABLES_FILE, "w", encoding="utf-8") as f:
+            json.dump(variables, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def validate_variable_name(name: str) -> str:
+    """변수명이 유효하면 빈 문자열, 아니면 사용자에게 보여줄 오류 사유를 반환.
+    - 비어 있으면 안 됨
+    - { } : 문자 금지(플레이스홀더 문법과 충돌)
+    - 순수 숫자 금지(위치 인자 {1},{2}… 와 충돌)
+    - '*' 금지(전체 인자 {*} 와 충돌)
+    - date/time/datetime 예약어 금지"""
+    name = (name or "").strip()
+    if not name:
+        return "변수명을 입력하세요."
+    if any(c in name for c in "{}:"):
+        return "변수명에 { } : 기호는 쓸 수 없습니다."
+    if name.isdigit():
+        return "숫자만으로 된 변수명은 위치 인자({1},{2}…)와 충돌합니다."
+    if name == "*":
+        return "'*' 는 전체 인자({*})에 예약되어 있습니다."
+    if name in _RESERVED_VAR_NAMES:
+        return f"'{name}' 은(는) 예약어(날짜/시간)입니다."
+    return ""
+
 # ── 관리자 권한 확인 ──────────────────────────────────────────────
 # KeyFlux 는 관리자 권한으로 실행되어야 관리자 권한 앱(관리자 VSCode·터미널)
 # 에서도 키 후킹·주입이 동작한다(Windows UIPI: 일반 권한 후크/주입은 승격된
@@ -549,33 +602,83 @@ def dbg(msg: str):
     except Exception:
         pass
 
-# ── 출력 텍스트 처리 (특수 변수 치환) ────────────────────────────
-# {date} {time} {datetime} 는 기본 형식을 그대로 사용하고,
-# {date:형식} 처럼 콜론 뒤에 strftime 형식 코드를 직접 적으면
-# 원하는 형식으로 출력할 수 있다.
-#   {date:%Y%m%d}   -> 20260613
-#   {date:%m-%d}    -> 06-13
-#   {time:%H:%M}    -> 20:03
-#   {datetime:%y%m%d_%H%M%S} -> 260613_200300
-_PLACEHOLDER_RE = re.compile(r"\{(date|time|datetime)(?::([^{}]*))?\}")
+# ── 출력 텍스트 처리 (플레이스홀더 치환) ─────────────────────────
+# 하나의 문법 {키(:형식/기본값)?} 로 아래를 모두 처리한다.
+#   {date} {time} {datetime}   : 날짜/시간 (콜론 뒤 strftime 형식 지정 가능)
+#       {date:%Y%m%d} -> 20260613,  {time:%H:%M} -> 20:03,  {date:%m-%d} -> 06-13
+#   {1} {2} …                  : 호출 시 위치 인자(공백으로 구분된 n번째)
+#       {1:기본값}             : 해당 인자가 없을 때 쓸 기본값
+#   {*}                        : 인자 전체(내부 공백 보존)
+#   {이름}                     : 미리 정의한 재사용 변수(설정 창에서 관리)
+#   {{ }}                      : 리터럴 중괄호(이스케이프)
+#
+# 해석 우선순위: ① date/time/datetime → ② 숫자 키(위치 인자) →
+#               ③ *(전체 인자) → ④ 변수명 → ⑤ 미해석 시 원본 그대로.
+# args/variables 를 넘기지 않으면 (기본값 None) 날짜/시간만 처리해
+# 기존 동작과 100% 호환된다.
+_PLACEHOLDER_RE = re.compile(r"\{([^{}:]+)(?::([^{}]*))?\}")
+# 출력에 위치 인자({1}, {*}) 가 들어 있는지 = "인자 대기(캡처)" 규칙인지 판별.
+_PARAM_RE = re.compile(r"\{(?:\d+|\*)(?::[^{}]*)?\}")
 _DEFAULT_DT_FORMATS = {
     "date": "%Y-%m-%d",
     "time": "%H:%M:%S",
     "datetime": "%Y-%m-%d %H:%M:%S",
 }
+# 리터럴 중괄호 이스케이프용 내부 임시 토큰(사용자 입력에 나타날 일이 없는 값).
+_ESC_OPEN = "\x00KF_LBRACE\x00"
+_ESC_CLOSE = "\x00KF_RBRACE\x00"
 
-def resolve_output(output: str) -> str:
+
+def output_is_parameterized(output: str) -> bool:
+    """출력에 위치 인자 플레이스홀더({1}, {*} 등)가 있으면 True.
+    True 인 special 규칙은 트리거 완성 후 인자 입력을 기다린다(캡처 모드).
+    이스케이프된 중괄호({{ }})는 인자로 보지 않는다."""
+    work = output.replace("{{", "").replace("}}", "")
+    return bool(_PARAM_RE.search(work))
+
+
+def resolve_output(output: str, args=None, variables=None,
+                   args_all: str = None) -> str:
+    """출력 템플릿의 플레이스홀더를 실제 값으로 치환한다.
+    - args      : 위치 인자 리스트(공백 split 결과). {1},{2}… 에 대응.
+    - args_all  : 인자 전체 문자열(내부 공백 보존). {*} 에 사용. None 이면
+                  " ".join(args) 로 대체.
+    - variables : {이름: 값} 재사용 변수 사전. {이름} 에 대응."""
     now = datetime.datetime.now()
+    args = args or []
+    variables = variables or {}
+    all_text = args_all if args_all is not None else " ".join(args)
+
+    # 이스케이프({{, }})를 임시 토큰으로 빼서 치환 대상에서 제외한다.
+    work = output.replace("{{", _ESC_OPEN).replace("}}", _ESC_CLOSE)
 
     def _sub(m):
-        kind = m.group(1)
-        fmt = m.group(2) if m.group(2) else _DEFAULT_DT_FORMATS[kind]
-        try:
-            return now.strftime(fmt)
-        except Exception:
-            return m.group(0)  # 잘못된 형식이면 원본 그대로 남김
+        key = m.group(1)
+        fmt = m.group(2)  # 콜론 뒤(형식/기본값). 없으면 None.
+        # ① 날짜/시간
+        if key in _DEFAULT_DT_FORMATS:
+            f = fmt if fmt else _DEFAULT_DT_FORMATS[key]
+            try:
+                return now.strftime(f)
+            except Exception:
+                return m.group(0)  # 잘못된 형식이면 원본 그대로 남김
+        # ② 위치 인자({1},{2}…) — 콜론 뒤는 인자가 없을 때 쓸 기본값
+        if key.isdigit():
+            idx = int(key)
+            if 1 <= idx <= len(args):
+                return args[idx - 1]
+            return fmt if fmt is not None else ""
+        # ③ 전체 인자({*})
+        if key == "*":
+            return all_text
+        # ④ 재사용 변수
+        if key in variables:
+            return variables[key]
+        # ⑤ 미해석 → 원본 그대로 남김(예: {nope})
+        return m.group(0)
 
-    return _PLACEHOLDER_RE.sub(_sub, output)
+    result = _PLACEHOLDER_RE.sub(_sub, work)
+    return result.replace(_ESC_OPEN, "{").replace(_ESC_CLOSE, "}")
 
 
 # ── 한글 자모 조합 (두벌식 오토마타) ─────────────────────────────
@@ -847,6 +950,19 @@ class KeyboardListener(QObject):
         # 되는 순간 그제서야 짧은 트리거를 확정 치환한다.
         self._pending = None        # (trigger, output, via) 또는 None
         self._pending_len = 0       # 보류 시점의 buffer 길이
+        self._pending_trig_raw_len = 0  # 보류된 트리거가 차지하는 원본(raw) 글자 수
+
+        # ── 재사용 변수 & 인라인 인자 캡처 상태 ───────────────────
+        # 출력에서 {이름} 으로 참조하는 재사용 변수 사전(설정 창에서 관리).
+        self.variables = {}
+        # 파라미터 규칙({1}/{*} 포함)의 트리거가 완성되면, 즉시 치환하지 않고
+        # 뒤이어 입력되는 인자를 모으는 "캡처 모드"로 들어간다. None 이면 평상시.
+        #   {trigger, output, via, trig_raw_len, start_len}
+        #   - trig_raw_len : 트리거가 buffer 에서 차지하는 원본 글자 수
+        #   - start_len    : 트리거 완성 시점의 buffer 길이(= 인자 시작 위치)
+        self._capturing = None
+        # 인자 캡처 안전장치: 인자가 이 길이를 넘으면 오작동으로 보고 캡처 취소.
+        self._CAPTURE_MAX_ARGS = 100
 
     def set_rules(self, rules):
         with self._lock:
@@ -862,6 +978,11 @@ class KeyboardListener(QObject):
     def set_case_guarantee(self, val: bool):
         """결과 대소문자 보장 옵션을 켜고 끈다(주입 시 CapsLock 보정 여부)."""
         self.case_guarantee = bool(val)
+
+    def set_variables(self, variables: dict):
+        """재사용 변수({이름: 값}) 사전을 갱신한다(출력의 {이름} 치환에 사용)."""
+        with self._lock:
+            self.variables = {str(k): str(v) for k, v in (variables or {}).items()}
 
     def _rebuild_indexes(self):
         """빠른 필터 인덱스와 정규화 트리거 캐시를 self.rules 기준으로 재생성.
@@ -952,6 +1073,7 @@ class KeyboardListener(QObject):
             self.composed = ""
             self._suppress_until = 0.0
             self._pending = None
+            self._capturing = None
 
     def _on_press(self, key):
         if not self.active:
@@ -970,6 +1092,11 @@ class KeyboardListener(QObject):
             ch = key.char
         except AttributeError:
             ch = None
+
+        # 인자 캡처 중이면 모든 키를 캡처 처리기로 넘긴다(다른 트리거 매칭 정지).
+        if self._capturing is not None:
+            self._handle_capture_key(key, ch)
+            return
 
         if ch is None:
             # 특수키 (Ctrl, Alt, F1~F12, 한자/한영키 등) → char가 None
@@ -1039,43 +1166,51 @@ class KeyboardListener(QObject):
             if matched_via is None:
                 continue
 
+            k = self._trig_raw_len(trig, matched_via, matched_k)
+
             # 더 긴 트리거(예: "::dev")가 있으면 즉시 치환하지 않고 보류.
             # (정규화 매칭은 보류 대상에서 제외 — 교차모드+접두사 겹침은 드묾)
             if matched_via != "norm" and self._holdable_rivals(trig):
                 self._pending = (trig, rule["output"], matched_via)
                 self._pending_len = len(self.buffer)
+                self._pending_trig_raw_len = k
                 return
 
             self._pending = None
+            # 파라미터 규칙({1}/{*} 포함)은 즉시 치환하지 않고 인자 캡처로 진입.
+            if output_is_parameterized(rule["output"]):
+                self._begin_capture(trig, rule["output"], matched_via, k,
+                                    len(self.buffer))
+                return
             self._fire_special(trig, rule["output"], matched_via, matched_k)
             return
 
         # 완전 일치 트리거 없음 → 보류 해소 여부 판단
         self._resolve_pending_if_needed()
 
+    def _trig_raw_len(self, trig, via, matched_k):
+        """트리거가 buffer(원본 자모)에서 차지하는 글자 수."""
+        if via == "raw":
+            return len(trig)
+        if via == "norm":
+            return matched_k
+        return self._consumed_raw_for(trig)
+
     def _resolve_pending_if_needed(self):
         """보류된 짧은 트리거가 있을 때, 더 긴 라이벌에 더는 도달할 수 없으면
-        지금 확정 치환한다. 아직 도달 가능하면 계속 기다린다."""
+        지금 확정한다(파라미터 규칙이면 캡처 진입). 아직 도달 가능하면 대기."""
         if not self._pending:
             return
-        p_trig, p_out, p_via = self._pending
+        p_trig = self._pending[0]
         if self._still_reaching(p_trig):
             return
-        # 보류 시점 이후 추가로 입력된 글자(extra)는 그대로 다시 찍어준다
-        extra = self.buffer[self._pending_len:]
-        self._pending = None
-        self._fire_special(p_trig, p_out, p_via, extra=extra)
+        self._confirm_pending_special()
 
     def _check_and_replace(self, append=""):
         # 보류된 짧은 트리거가 있고, 더 긴 라이벌에 도달할 수 없으면
         # (스페이스/엔터로 단어가 끝났으므로 대개 도달 불가) 지금 확정한다.
-        # 화면에는 트리거 + 이후 입력 + 방금 누른 스페이스/엔터가 찍혀 있으므로
-        # 그만큼 다시 찍어주도록 extra 에 함께 넘긴다.
         if self._pending and not self._still_reaching(self._pending[0]):
-            p_trig, p_out, p_via = self._pending
-            extra = self.buffer[self._pending_len:] + append
-            self._pending = None
-            self._fire_special(p_trig, p_out, p_via, extra=extra)
+            self._confirm_pending_special(append=append)
             return
 
         with self._lock:
@@ -1123,6 +1258,118 @@ class KeyboardListener(QObject):
         self.buffer += append
         self.composed = compose_hangul(self.buffer)
 
+    # ── 인라인 인자 캡처 상태머신 ─────────────────────────────────
+    def _begin_capture(self, trig, output, via, trig_raw_len, start_len):
+        """파라미터 규칙의 트리거가 완성됐을 때 인자 캡처 모드로 진입한다.
+        이후 입력되는 글자/공백은 화면에 그대로 보이며 인자로 누적되고,
+        Enter 로 확정(캡처 종료)한다."""
+        self._pending = None
+        self._capturing = {
+            "trigger": trig, "output": output, "via": via,
+            "trig_raw_len": trig_raw_len, "start_len": start_len,
+        }
+        dbg(f"CAPTURE start trig={trig!r} via={via} "
+            f"trig_raw={trig_raw_len} start_len={start_len}")
+
+    def _confirm_pending_special(self, append=""):
+        """보류(pending)됐던 special 트리거를 확정한다.
+        파라미터 규칙이면 캡처로 진입(엔터로 확정됐으면 즉시 종료),
+        아니면 기존대로 즉시 치환한다. append 는 확정 계기가 된
+        스페이스/엔터(''·' '·'\\n')."""
+        p_trig, p_out, p_via = self._pending
+        k = self._pending_trig_raw_len
+        self._pending = None
+
+        if not output_is_parameterized(p_out):
+            # 비파라미터: 보류 이후 입력분 + 스페이스/엔터를 그대로 다시 찍는다.
+            extra = self.buffer[self._pending_len:] + append
+            self._fire_special(p_trig, p_out, p_via, extra=extra)
+            return
+
+        if append == "\n":
+            # 엔터로 확정 → 인자 없이 즉시 종료(종료자 엔터는 화면에서 삭제).
+            self._begin_capture(p_trig, p_out, p_via, k, self._pending_len)
+            self._finalize_capture()
+            return
+        # 스페이스(또는 라이벌을 깬 일반 글자)로 확정 → 캡처 진입.
+        # 스페이스면 인자 시작 구분 공백으로 버퍼에 반영한다.
+        if append:
+            self.buffer += append
+            self.composed = compose_hangul(self.buffer)
+        self._begin_capture(p_trig, p_out, p_via, k, self._pending_len)
+
+    def _handle_capture_key(self, key, ch):
+        """캡처 모드에서 들어오는 키 처리.
+        - 일반 글자/공백 → 버퍼에 누적(화면에도 그대로 보임)
+        - Enter          → 확정(인자 종료 + 치환), 종료자 엔터는 화면에서 삭제
+        - Backspace      → 한 글자 지움. 트리거 이전까지 지우면 캡처 취소
+        - 그 외 특수키(Esc/Tab/방향키/Ctrl 조합 등) → 캡처 취소(안전장치)"""
+        cap = self._capturing
+        if ch is not None:
+            self.buffer += ch
+            if len(self.buffer) > 400:
+                self.buffer = self.buffer[-400:]
+                cap["start_len"] = min(cap["start_len"], len(self.buffer))
+            self.composed = compose_hangul(self.buffer)
+            if len(self.buffer) - cap["start_len"] > self._CAPTURE_MAX_ARGS:
+                dbg("CAPTURE cancel (args too long)")
+                self._cancel_capture()
+            return
+        if key == Key.space:
+            self.buffer += " "
+            self.composed = compose_hangul(self.buffer)
+            if len(self.buffer) - cap["start_len"] > self._CAPTURE_MAX_ARGS:
+                dbg("CAPTURE cancel (args too long)")
+                self._cancel_capture()
+            return
+        if key == Key.enter:
+            self._finalize_capture()
+            return
+        if key == Key.backspace:
+            self.buffer = self.buffer[:-1]
+            self.composed = compose_hangul(self.buffer)
+            # 트리거 이전(인자 시작 위치보다 앞)까지 지우면 캡처 취소.
+            if len(self.buffer) < cap["start_len"]:
+                dbg("CAPTURE cancel (backspaced past trigger)")
+                self._cancel_capture()
+            return
+        # 그 외 특수키는 캡처를 취소한다(입력 하이재킹 방지 안전장치).
+        dbg(f"CAPTURE cancel (special key {key!r})")
+        self._cancel_capture()
+
+    def _cancel_capture(self):
+        """캡처를 취소한다. 화면/버퍼에 남은 입력은 그대로 두어 사용자가
+        친 글자가 사라지지 않게 한다(치환 없이 평상시 상태로 복귀)."""
+        self._capturing = None
+
+    def _finalize_capture(self):
+        """캡처된 인자로 출력을 완성해 치환한다.
+        지울 스팬 = 트리거 + (구분 공백) + 인자, 그리고 종료자 Enter(화면의
+        줄바꿈)까지 함께 삭제하되 종료자는 다시 찍지 않는다."""
+        cap = self._capturing
+        self._capturing = None
+
+        start = cap["start_len"]
+        args_raw = self.buffer[start:]
+        args_region = compose_hangul(args_raw)
+        # 트리거와 인자 사이의 구분 공백 1개 제거.
+        if args_region.startswith(" "):
+            args_region = args_region[1:]
+        args = args_region.split()
+        consumed_raw = cap["trig_raw_len"] + (len(self.buffer) - start)
+
+        with self._lock:
+            variables = dict(self.variables)
+
+        dbg(f"CAPTURE finalize trig={cap['trigger']!r} args={args!r} "
+            f"all={args_region!r} consumed_raw={consumed_raw}")
+        # 종료자 Enter 는 화면에 줄바꿈으로 이미 찍혀 있으므로 consume_extra 로
+        # 함께 삭제하되(재타이핑 X), 출력이 그 자리를 대체한다.
+        self._do_replace(cap["trigger"], cap["output"], via=cap["via"],
+                         consumed_raw=consumed_raw, args=args,
+                         variables=variables, args_all=args_region,
+                         consume_extra="\n")
+
     def _do_replace_norm(self, trigger: str, output: str, k: int, extra: str = ""):
         """정규화(한/영·대소문자 무관) 매칭 결과 치환.
         buffer 의 마지막 k 글자가 트리거에 해당하므로, 그 글자 수(k)를
@@ -1141,14 +1388,26 @@ class KeyboardListener(QObject):
         return len(compose_hangul(trigger)) or len(trigger)
 
     def _do_replace(self, trigger: str, output: str, extra: str = "",
-                    via: str = "composed", consumed_raw: int = None):
+                    via: str = "composed", consumed_raw: int = None,
+                    args=None, variables=None, args_all: str = None,
+                    consume_extra: str = ""):
+        # extra        : 트리거를 완성시킨 스페이스/엔터처럼 화면에 이미 찍혀
+        #                있고 치환 후에도 그대로 남길 글자(백스페이스 후 재타이핑).
+        # consume_extra: 화면에 찍혀 있으나 삭제만 하고 다시 찍지 않을 글자
+        #                (파라미터 규칙의 종료자 Enter 등).
+        # args/variables/args_all: 파라미터/변수 치환용(resolve_output 로 전달).
         # 재귀/중첩 호출 방어: 이전 치환의 입력 주입이 아직 진행 중이면 무시
         if self._replacing:
             dbg(f"REPLACE skipped (busy) trig={trigger!r}")
             return
         self._replacing = True
 
-        resolved = resolve_output(output)
+        # 변수는 파라미터 규칙뿐 아니라 일반 규칙({회사}만 있는 경우 등)에서도
+        # 즉시 치환돼야 하므로, 호출자가 넘기지 않으면 리스너 변수를 기본 사용.
+        if variables is None:
+            variables = self.variables
+        resolved = resolve_output(output, args=args, variables=variables,
+                                  args_all=args_all)
 
         # ── 트리거가 버퍼에서 차지하는 '원본(raw) 글자 수' 결정 ────────────
         #   - raw       : 트리거가 입력 그대로이므로 len(trigger)
@@ -1178,8 +1437,10 @@ class KeyboardListener(QObject):
 
         # extra(스페이스/엔터)는 word/regex 트리거를 완성시킨 "그 키 입력"인데,
         # suppress=False라 이미 화면에 정상적으로 찍혀 있는 상태다.
-        # 즉 백스페이스 시점의 화면 = (트리거+병합 앞글자) + extra 1글자.
-        backspace_count = trigger_backspaces + len(extra)
+        # consume_extra(파라미터 규칙의 종료자 Enter 등)도 화면에 찍혀 있으므로
+        # 백스페이스 대상이지만, to_type 에는 넣지 않아 다시 찍히지 않는다.
+        # 즉 백스페이스 시점의 화면 = (트리거+병합 앞글자) + extra + consume_extra.
+        backspace_count = trigger_backspaces + len(extra) + len(consume_extra)
 
         # 실제 입력 주입(백스페이스+붙여넣기)에 걸릴 예상 시간을 계산해
         # 그동안의 키 이벤트는 무시(억제)한다.
@@ -1343,13 +1604,110 @@ class KeyboardListener(QObject):
 
 
 
+# ── 플레이스홀더 문법 도움말 ─────────────────────────────────────
+# 출력에 쓸 수 있는 모든 문법을 한곳에서 안내한다. 규칙 편집 창과 변수
+# 관리 화면의 "도움말" 버튼이 공유한다.
+def _placeholder_help_html(variables: dict = None) -> str:
+    variables = variables or {}
+    if variables:
+        var_rows = "".join(
+            f"<tr><td><code>{{{name}}}</code></td><td>{val}</td></tr>"
+            for name, val in list(variables.items())[:12]
+        )
+        var_example = (
+            "<p>현재 등록된 변수 (설정 → 변수 관리에서 추가/수정):</p>"
+            f"<table>{var_rows}</table>"
+        )
+    else:
+        var_example = (
+            "<p>아직 등록된 변수가 없습니다. <b>설정 → 변수 관리</b>에서 "
+            "<code>{회사}=한빛</code> 처럼 추가하면 출력에서 <code>{회사}</code> "
+            "로 재사용할 수 있습니다.</p>"
+        )
+    return f"""
+    <style>
+      body {{ font-size: 13px; line-height: 1.5; }}
+      h3 {{ color:#9370DB; margin:14px 0 4px; font-size:14px; }}
+      code {{ background:#1A1D2A; color:#7CD6F0; padding:1px 5px;
+              border-radius:4px; }}
+      table {{ border-collapse:collapse; margin:4px 0 8px; }}
+      td {{ padding:2px 12px 2px 0; }}
+      .ex {{ color:#4ADE80; }}
+    </style>
+    <h3>1. 날짜 · 시간</h3>
+    <table>
+      <tr><td><code>{{date}}</code></td><td>오늘 날짜 → <span class="ex">2026-07-11</span></td></tr>
+      <tr><td><code>{{time}}</code></td><td>현재 시각 → <span class="ex">20:03:00</span></td></tr>
+      <tr><td><code>{{datetime}}</code></td><td>날짜+시각</td></tr>
+      <tr><td><code>{{date:%Y%m%d}}</code></td><td>형식 지정 → <span class="ex">20260711</span></td></tr>
+      <tr><td><code>{{date:%m-%d}}</code></td><td>→ <span class="ex">07-11</span></td></tr>
+    </table>
+
+    <h3>2. 호출 시 인자 (위치 인자)</h3>
+    <p><b>special(;단축어) 규칙</b>의 출력에 <code>{{1}}</code> <code>{{2}}</code> …
+    를 넣으면, 트리거를 친 뒤 <b>공백으로 인자를 이어 입력하고 Enter 로 확정</b>합니다.</p>
+    <table>
+      <tr><td><code>{{1}}</code> <code>{{2}}</code></td><td>공백으로 구분한 1·2번째 인자</td></tr>
+      <tr><td><code>{{*}}</code></td><td>인자 전체(내부 공백 보존)</td></tr>
+      <tr><td><code>{{1:기본값}}</code></td><td>그 인자가 없을 때 쓸 기본값</td></tr>
+    </table>
+    <p>예) 트리거 <code>;메일</code>, 출력 <code>{{1}} 님께</code> →
+    <span class="ex">;메일 홍길동⏎</span> 입력 시 <span class="ex">홍길동 님께</span></p>
+
+    <h3>3. 재사용 변수</h3>
+    <table>
+      <tr><td><code>{{이름}}</code></td><td>미리 정의한 값으로 치환</td></tr>
+    </table>
+    {var_example}
+
+    <h3>4. 리터럴 중괄호</h3>
+    <p><code>{{{{</code> → <code>{{</code>,&nbsp; <code>}}}}</code> → <code>}}</code>
+    (중괄호 자체를 그대로 출력하고 싶을 때)</p>
+
+    <h3>참고</h3>
+    <ul>
+      <li>인자 입력(위 2번)은 <b>special 트리거</b>에서만 동작합니다(word/regex 제외).</li>
+      <li>인자에는 한글도 그대로 쓸 수 있습니다(화면에 보이는 그대로 삽입).</li>
+      <li>Enter 는 인자 입력을 끝내는 <b>종료키</b>이므로, 출력에 줄바꿈을
+          넣으려면 출력 편집 칸에서 직접 Enter 로 줄을 나누세요.</li>
+    </ul>
+    """
+
+
+def show_placeholder_help(parent=None, variables: dict = None):
+    """플레이스홀더 문법 도움말 창을 띄운다(스크롤 가능한 읽기 전용)."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("출력 문법 도움말")
+    dlg.setWindowIcon(make_app_icon())
+    dlg.setMinimumSize(480, 560)
+    if parent:
+        dlg.setStyleSheet(parent.styleSheet())
+    lay = QVBoxLayout(dlg)
+    lay.setContentsMargins(16, 16, 16, 12)
+    lay.setSpacing(10)
+    browser = QTextBrowser()
+    browser.setOpenExternalLinks(False)
+    browser.setStyleSheet(
+        "QTextBrowser { background:#0F1117; color:#E8E8F0; border:1px solid "
+        "#252840; border-radius:8px; padding:8px; }")
+    browser.setHtml(_placeholder_help_html(variables))
+    lay.addWidget(browser)
+    btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+    btns.rejected.connect(dlg.accept)
+    btns.accepted.connect(dlg.accept)
+    lay.addWidget(btns)
+    dlg.exec()
+
+
 # ── 규칙 추가/편집 다이얼로그 ────────────────────────────────────
 class RuleDialog(QDialog):
-    def __init__(self, parent=None, rule=None):
+    def __init__(self, parent=None, rule=None, variables=None):
         super().__init__(parent)
         self.setWindowTitle("규칙 편집" if rule else "규칙 추가")
-        self.setFixedSize(420, 400)
+        self.setFixedSize(440, 470)
         self.setStyleSheet(parent.styleSheet() if parent else "")
+        # 미리보기에서 {이름} 을 실제 값으로 보여주기 위한 현재 변수 사전.
+        self._variables = dict(variables or {})
 
         layout = QFormLayout(self)
         layout.setSpacing(12)
@@ -1387,6 +1745,17 @@ class RuleDialog(QDialog):
         )
         self.preview_label.setWordWrap(True)
         layout.addRow("미리보기", self.preview_label)
+
+        # 파라미터({1}/{*}) 규칙임을 알려주는 배지(해당할 때만 보임).
+        self.param_badge = QLabel()
+        self.param_badge.setWordWrap(True)
+        self.param_badge.setStyleSheet(
+            "color:#F0B45C; font-size:11px; font-weight:600; "
+            "background:#241E12; border:1px solid #4A3A1A; "
+            "border-radius:6px; padding:5px 9px;")
+        self.param_badge.setVisible(False)
+        layout.addRow("", self.param_badge)
+
         self.output_edit.textChanged.connect(self._update_preview)
         self._update_preview()
 
@@ -1398,15 +1767,22 @@ class RuleDialog(QDialog):
         save_sc2.activated.connect(self.accept)
 
         hint = QLabel(
-            "특수 변수: {date} {time} {datetime}\n"
-            "형식 지정: {date:%Y%m%d} → 20260613   {time:%H:%M} → 20:03\n"
-            "           {date:%m-%d} → 06-13\n"
-            "출력에 Enter 로 줄바꿈 포함 가능 · Ctrl+Enter 로 저장"
+            "{date} {time} {datetime} · {1} {2} {*}(인자) · {이름}(변수)\n"
+            "형식 지정: {date:%Y%m%d} → 20260711   {time:%H:%M} → 20:03\n"
+            "자세한 문법은 아래 '문법 도움말' 참고 · Ctrl+Enter 로 저장"
         )
         hint.setStyleSheet("color: #888; font-size: 11px;")
         layout.addRow("", hint)
 
         btn_row = QHBoxLayout()
+        help_btn = QPushButton("? 문법 도움말")
+        help_btn.setObjectName("secondary")
+        help_btn.setAutoDefault(False)
+        help_btn.setToolTip("출력에 쓸 수 있는 모든 문법을 봅니다")
+        help_btn.clicked.connect(
+            lambda: show_placeholder_help(self, self._variables))
+        btn_row.addWidget(help_btn)
+        btn_row.addStretch()
         ok_btn     = QPushButton("저장")
         ok_btn.clicked.connect(self.accept)
         # 트리거(QLineEdit)에 포커스가 있을 때 Enter 로 저장되도록 "저장"
@@ -1429,8 +1805,18 @@ class RuleDialog(QDialog):
             self.output_edit.setPlainText(rule["output"])
             self._update_preview()
 
+    # 미리보기에서 위치 인자({1},{2}…)를 채울 샘플 값.
+    _SAMPLE_ARGS = ["인자1", "인자2", "인자3"]
+
     def _update_preview(self):
         text = self.output_edit.toPlainText()
+        # 파라미터({1}/{*}) 규칙이면 배지를 켠다.
+        is_param = output_is_parameterized(text)
+        self.param_badge.setVisible(is_param)
+        if is_param:
+            self.param_badge.setText(
+                "이 규칙은 호출 시 인자를 받습니다 — 트리거 뒤에 공백으로 "
+                "인자를 입력하고 Enter 로 확정하세요. (아래는 샘플 인자 예시)")
         if not text:
             self.preview_label.setText("(출력 내용을 입력하세요)")
             self.preview_label.setStyleSheet(
@@ -1440,7 +1826,9 @@ class RuleDialog(QDialog):
             )
             return
         try:
-            preview = resolve_output(text)
+            preview = resolve_output(
+                text, args=self._SAMPLE_ARGS, variables=self._variables,
+                args_all=" ".join(self._SAMPLE_ARGS))
             self.preview_label.setText(f"→ {preview}")
             self.preview_label.setStyleSheet(
                 "color: #4ADE80; font-size: 12px; font-weight: 600; "
@@ -1465,6 +1853,59 @@ class RuleDialog(QDialog):
             "output":  self.output_edit.toPlainText(),
             "enabled": True,
         }
+
+
+# ── 재사용 변수 추가/편집 다이얼로그 ─────────────────────────────
+class VariableDialog(QDialog):
+    """재사용 변수(이름·값) 입력. 이름은 validate_variable_name 로 검증한다.
+    edit_name 이 주어지면 편집 모드(이름 칸은 그대로 두되 중복 검사에서 제외)."""
+
+    def __init__(self, parent=None, name="", value="", existing=None,
+                 edit_name=None):
+        super().__init__(parent)
+        self.setWindowTitle("변수 편집" if edit_name else "변수 추가")
+        self.setFixedWidth(360)
+        self.setStyleSheet(parent.styleSheet() if parent else "")
+        self._existing = set(existing or [])
+        self._edit_name = edit_name
+
+        layout = QFormLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 20, 20, 16)
+
+        self.name_edit = QLineEdit(name)
+        self.name_edit.setPlaceholderText("예: 회사  (출력에서 {회사} 로 사용)")
+        self.value_edit = QLineEdit(value)
+        self.value_edit.setPlaceholderText("예: 한빛")
+        layout.addRow("이름", self.name_edit)
+        layout.addRow("값", self.value_edit)
+
+        hint = QLabel("이름에 { } : 기호·순수 숫자·* 는 쓸 수 없습니다.")
+        hint.setStyleSheet("color:#888; font-size:11px;")
+        hint.setWordWrap(True)
+        layout.addRow("", hint)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save |
+            QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        layout.addRow("", btns)
+
+    def _on_accept(self):
+        name = self.name_edit.text().strip()
+        err = validate_variable_name(name)
+        if err:
+            QMessageBox.warning(self, "변수명 오류", err)
+            return
+        # 편집 중인 자기 자신을 제외하고 중복 이름 검사.
+        if name != self._edit_name and name in self._existing:
+            QMessageBox.warning(self, "중복", f"'{name}' 변수가 이미 있습니다.")
+            return
+        self.accept()
+
+    def get_variable(self):
+        return self.name_edit.text().strip(), self.value_edit.text()
 
 
 # ── 드래그로 행 순서 변경 가능한 테이블 ───────────────────────────
@@ -1555,6 +1996,7 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(make_app_icon())  # 창/작업표시줄 아이콘
         self.rules = load_rules()
         self.settings = load_settings()
+        self.variables = load_variables()
         set_debug(self.settings.get("debug_log", False))
         self._apply_style()
         self._init_listener()
@@ -1873,6 +2315,8 @@ class MainWindow(QMainWindow):
         ver_label.setStyleSheet("color: #9370DB; font-weight: 700; font-size: 13px;")
         lay.addWidget(ver_label)
 
+        lay.addWidget(self._build_variables_box())
+
         match_box = QGroupBox("매칭 동작")
         mb = QVBoxLayout(match_box)
         mb.setSpacing(8)
@@ -1899,6 +2343,122 @@ class MainWindow(QMainWindow):
         btns.rejected.connect(dlg.hide)
         lay.addWidget(btns)
         return dlg
+
+    # ── 재사용 변수 관리 UI ──────────────────────────────────────
+    def _build_variables_box(self) -> QGroupBox:
+        """설정 창의 '변수 관리' 그룹박스(이름·값 테이블 + 추가/편집/삭제)."""
+        box = QGroupBox("변수 관리  (출력에서 {이름} 으로 재사용)")
+        v = QVBoxLayout(box)
+        v.setSpacing(8)
+
+        self.var_table = QTableWidget()
+        self.var_table.setColumnCount(2)
+        self.var_table.setHorizontalHeaderLabels(["이름", "값"])
+        self.var_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents)
+        self.var_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch)
+        self.var_table.verticalHeader().setVisible(False)
+        self.var_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.var_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows)
+        self.var_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection)
+        self.var_table.setShowGrid(False)
+        self.var_table.setFixedHeight(140)
+        self.var_table.cellDoubleClicked.connect(
+            lambda *_: self._edit_variable())
+        v.addWidget(self.var_table)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        add_btn = QPushButton("+ 변수 추가")
+        add_btn.clicked.connect(self._add_variable)
+        edit_btn = QPushButton("편집")
+        edit_btn.setObjectName("secondary")
+        edit_btn.clicked.connect(self._edit_variable)
+        del_btn = QPushButton("삭제")
+        del_btn.setObjectName("danger")
+        del_btn.clicked.connect(self._delete_variable)
+        help_btn = QPushButton("? 문법 도움말")
+        help_btn.setObjectName("secondary")
+        help_btn.clicked.connect(
+            lambda: show_placeholder_help(self._settings_dialog or self,
+                                          self.variables))
+        row.addWidget(add_btn)
+        row.addWidget(edit_btn)
+        row.addWidget(del_btn)
+        row.addStretch()
+        row.addWidget(help_btn)
+        v.addLayout(row)
+
+        self._refresh_variables_table()
+        return box
+
+    def _refresh_variables_table(self):
+        self.var_table.setRowCount(0)
+        for i, (name, val) in enumerate(sorted(self.variables.items())):
+            self.var_table.insertRow(i)
+            name_item = QTableWidgetItem(name)
+            name_font = QFont("Segoe UI")
+            name_font.setBold(True)
+            name_item.setFont(name_font)
+            name_item.setForeground(QColor("#7CD6F0"))
+            self.var_table.setItem(i, 0, name_item)
+            self.var_table.setItem(i, 1, QTableWidgetItem(val))
+            self.var_table.setRowHeight(i, 34)
+
+    def _selected_variable_name(self):
+        row = self.var_table.currentRow()
+        if row < 0:
+            return None
+        item = self.var_table.item(row, 0)
+        return item.text() if item else None
+
+    def _add_variable(self):
+        dlg = VariableDialog(self._settings_dialog or self,
+                             existing=set(self.variables))
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            name, value = dlg.get_variable()
+            self.variables[name] = value
+            self._on_variables_changed()
+
+    def _edit_variable(self):
+        name = self._selected_variable_name()
+        if name is None:
+            QMessageBox.information(
+                self._settings_dialog or self, "알림", "편집할 변수를 선택하세요.")
+            return
+        dlg = VariableDialog(
+            self._settings_dialog or self, name=name,
+            value=self.variables.get(name, ""),
+            existing=set(self.variables), edit_name=name)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_name, value = dlg.get_variable()
+            if new_name != name:
+                self.variables.pop(name, None)  # 이름이 바뀌면 옛 키 제거
+            self.variables[new_name] = value
+            self._on_variables_changed()
+
+    def _delete_variable(self):
+        name = self._selected_variable_name()
+        if name is None:
+            QMessageBox.information(
+                self._settings_dialog or self, "알림", "삭제할 변수를 선택하세요.")
+            return
+        reply = QMessageBox.question(
+            self._settings_dialog or self, "삭제 확인",
+            f"'{name}' 변수를 삭제할까요?")
+        if reply == QMessageBox.StandardButton.Yes:
+            self.variables.pop(name, None)
+            self._on_variables_changed()
+
+    def _on_variables_changed(self):
+        """변수 변경을 저장하고 리스너·테이블에 전파한다."""
+        save_variables(self.variables)
+        self.listener.set_variables(self.variables)
+        self._refresh_variables_table()
+        self.status_label.setText(f"변수 {len(self.variables)}개 저장됨")
 
     def _open_settings(self):
         if self._settings_dialog is None:
@@ -1985,7 +2545,7 @@ class MainWindow(QMainWindow):
 
     # ── 규칙 CRUD ────────────────────────────────────────────────
     def _add_rule(self):
-        dlg = RuleDialog(self)
+        dlg = RuleDialog(self, variables=self.variables)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             rule = dlg.get_rule()
             if rule["trigger"] and rule["output"]:
@@ -1998,7 +2558,7 @@ class MainWindow(QMainWindow):
         if row < 0:
             QMessageBox.information(self, "알림", "편집할 규칙을 선택하세요.")
             return
-        dlg = RuleDialog(self, self.rules[row])
+        dlg = RuleDialog(self, self.rules[row], variables=self.variables)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             new_rule = dlg.get_rule()
             new_rule["enabled"] = self.rules[row].get("enabled", True)
@@ -2192,6 +2752,7 @@ class MainWindow(QMainWindow):
         self.listener.normalize_mode = bool(self.settings.get("normalize_mode", True))
         self.listener.case_guarantee = bool(
             self.settings.get("output_case_guarantee", True))
+        self.listener.set_variables(self.variables)
         self.listener.set_rules(self.rules)
 
     def _connect_listener_signals(self):
