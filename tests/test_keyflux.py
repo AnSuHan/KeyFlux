@@ -12,6 +12,8 @@ KeyboardListener 의 실제 치환(_do_replace / _do_replace_norm)은 OS 에 키
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -559,8 +561,8 @@ class _ScreenSim:
         self.L.set_rules([rule])
         self.cap = {}
 
-        def fake_inject(trigger, to_type, resolved, bs):
-            self.cap.update(to_type=to_type, bs=bs)
+        def fake_inject(trigger, to_type, resolved, bs, composing=False):
+            self.cap.update(to_type=to_type, bs=bs, composing=composing)
             self.L._replacing = False
 
         self.L._inject_replacement = fake_inject
@@ -740,9 +742,10 @@ class TestCaptureStateMachine(unittest.TestCase):
 # ── 변환(치환) 중 사용자 실입력 전역 차단 판단 ────────────────────
 class _FakeHookData:
     """pynput 저수준 후크의 _KBDLLHOOKSTRUCT 를 흉내내는 가짜 데이터."""
-    def __init__(self, flags, vk=8):
+    def __init__(self, flags, vk=8, scan=0):
         self.flags = flags
         self.vkCode = vk
+        self.scanCode = scan
 
 
 class TestBlockingDuringReplace(unittest.TestCase):
@@ -806,6 +809,449 @@ class TestBlockingDuringReplace(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             L._win32_event_filter(0x0100, _FakeHookData(0x00))
         self.assertEqual(calls, [True])
+
+
+# ── 차단한 사용자 키를 버리지 않고 되돌려주기 ──────────────────────
+class _SuppressCalled(Exception):
+    """pynput 의 suppress_event() 처럼 필터 실행을 중단시키는 신호."""
+
+
+class _SuppressingListener:
+    def __init__(self):
+        self.suppressed = 0
+
+    def suppress_event(self):
+        self.suppressed += 1
+        raise _SuppressCalled()
+
+
+class TestBlockedKeysReplayed(unittest.TestCase):
+    """단축어가 텍스트로 바뀌는 짧은 동안 사용자가 이어서 친 키(특히 뒤의
+    띄어쓰기)도 전역 차단된다. 차단만 하고 버리면 그 글자는 화면에서 아예
+    사라지므로, 차단분은 큐에 모아 두었다가 치환이 끝난 뒤 그대로 돌려줘야
+    한다."""
+
+    VK_SPACE = 0x20
+
+    def _listener(self):
+        L = main.KeyboardListener()
+        L.set_rules([{"type": "special", "trigger": ";abc",
+                      "output": "OUT", "enabled": True}])
+        L._listener = _SuppressingListener()
+        return L
+
+    def test_blocked_key_is_queued_not_dropped(self):
+        L = self._listener()
+        L._replacing = True  # 치환 주입 중
+        with self.assertRaises(_SuppressCalled):
+            L._win32_event_filter(0x0100, _FakeHookData(0x00, vk=self.VK_SPACE,
+                                                        scan=57))
+        self.assertEqual(L._listener.suppressed, 1, "차단 자체는 그대로 한다")
+        self.assertEqual(L._blocked_keys, [(self.VK_SPACE, 57, 0)],
+                         "차단한 키는 버려지지 않고 큐에 남는다")
+
+    def test_keyup_and_extended_flags_preserved(self):
+        L = self._listener()
+        L._replacing = True
+        with self.assertRaises(_SuppressCalled):  # 뗌(keyup)
+            L._win32_event_filter(0x0101, _FakeHookData(0x00, vk=self.VK_SPACE,
+                                                        scan=57))
+        with self.assertRaises(_SuppressCalled):  # 확장키(←)
+            L._win32_event_filter(0x0100, _FakeHookData(0x01, vk=0x25, scan=75))
+        self.assertEqual(L._blocked_keys, [
+            (self.VK_SPACE, 57, main._KEYEVENTF_KEYUP),
+            (0x25, 75, main._KEYEVENTF_EXTENDEDKEY),
+        ], "눌림/뗌·확장키 여부까지 보존해야 원래대로 재생된다")
+
+    def test_our_own_injected_keys_are_not_queued(self):
+        L = self._listener()
+        L._replacing = True
+        inj = main.KeyboardListener._LLKHF_INJECTED
+        L._win32_event_filter(0x0100, _FakeHookData(inj, vk=self.VK_SPACE))
+        self.assertEqual(L._blocked_keys, [], "우리 주입분은 재생 대상이 아니다")
+
+    def test_queue_is_capped(self):
+        L = self._listener()
+        L._replacing = True
+        for _ in range(main.KeyboardListener._MAX_BLOCKED_KEYS + 20):
+            with self.assertRaises(_SuppressCalled):
+                L._win32_event_filter(0x0100, _FakeHookData(0x00,
+                                                            vk=self.VK_SPACE))
+        self.assertEqual(len(L._blocked_keys),
+                         main.KeyboardListener._MAX_BLOCKED_KEYS,
+                         "큐가 무한정 자라지 않는다")
+
+    def test_replay_sends_queued_keys_and_lifts_suppression(self):
+        L = self._listener()
+        sent = []
+        orig = main.send_key_events
+        main.send_key_events = lambda events: (sent.extend(events), True)[1]
+        try:
+            L._suppress_until = time.monotonic() + 5
+            L._blocked_keys = [(self.VK_SPACE, 57, 0)]
+            L._replay_blocked_keys()
+        finally:
+            main.send_key_events = orig
+        self.assertEqual(sent, [(self.VK_SPACE, 57, 0)], "차단분을 그대로 재전송")
+        self.assertEqual(L._blocked_keys, [], "큐는 비워진다")
+        self.assertLessEqual(L._suppress_until, time.monotonic(),
+                             "재생분이 버퍼에도 반영되도록 억제를 먼저 푼다")
+
+    def test_key_blocked_after_injection_is_still_replayed(self):
+        """주입은 끝났지만 억제 시간이 조금 남은 구간에서 차단된 키도
+        (되돌려줄 주입 스레드가 없으므로) 예약 타이머가 비워 줘야 한다."""
+        L = self._listener()
+        sent = []
+        orig = main.send_key_events
+        main.send_key_events = lambda events: (sent.extend(events), True)[1]
+        try:
+            L._replacing = False
+            L._suppress_until = time.monotonic() + 0.05  # 억제 꼬리 구간
+            with self.assertRaises(_SuppressCalled):
+                L._win32_event_filter(0x0100, _FakeHookData(0x00,
+                                                            vk=self.VK_SPACE,
+                                                            scan=57))
+            self.assertEqual(L._blocked_keys, [(self.VK_SPACE, 57, 0)])
+            deadline = time.monotonic() + 5
+            while sent == [] and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            main.send_key_events = orig
+        self.assertEqual(sent, [(self.VK_SPACE, 57, 0)],
+                         "억제가 풀리는 시점에 차단분이 되돌아와야 한다")
+        self.assertEqual(L._blocked_keys, [])
+
+    def test_deactivate_drops_queued_keys(self):
+        L = self._listener()
+        L._blocked_keys = [(self.VK_SPACE, 57, 0)]
+        L.set_active(False)
+        self.assertEqual(L._blocked_keys, [],
+                         "꺼진 뒤 엉뚱한 시점에 되돌려주지 않는다")
+
+    def test_spaces_around_a_shortcut_survive(self):
+        """문장 중간에서 "안녕 ;abc " 처럼 쓸 때, 단축어 앞의 띄어쓰기는
+        물론 치환 도중 곧바로 친 뒤쪽 띄어쓰기까지 남아 "안녕 OUT " 이
+        되어야 한다(종전엔 뒤쪽 스페이스가 통째로 사라졌음)."""
+        L = self._listener()
+        done = threading.Event()
+
+        orig = main.send_key_events
+
+        def fake_send(events):  # OS 역할: 재생된 키를 리스너에게 되돌린다
+            for vk, _scan, flags in events:
+                if flags & main._KEYEVENTF_KEYUP:
+                    continue
+                if vk == self.VK_SPACE:
+                    L._on_press(main.Key.space)
+            return True
+
+        def fake_inject(trigger, to_type, resolved, bs, composing=False):
+            # 주입이 도는 동안 사용자가 스페이스를 친다 → 후크가 차단
+            try:
+                try:
+                    L._win32_event_filter(0x0100,
+                                          _FakeHookData(0x00, vk=self.VK_SPACE,
+                                                        scan=57))
+                except _SuppressCalled:
+                    pass
+            finally:
+                L._replacing = False
+                L._replay_blocked_keys()
+                done.set()
+
+        L._inject_replacement = fake_inject
+        main.send_key_events = fake_send
+        try:
+            for ch in "hi":                 # 앞 문맥
+                L._on_press(_FakeCharKey(ch))
+            L._on_press(main.Key.space)     # 단축어 앞의 띄어쓰기
+            for ch in ";abc":
+                L._on_press(_FakeCharKey(ch))
+            self.assertTrue(done.wait(5), "주입 스레드가 끝나야 한다")
+        finally:
+            main.send_key_events = orig
+
+        self.assertEqual(L._blocked_keys, [])
+        self.assertEqual(L.buffer, "hi OUT ",
+                         "단축어 앞뒤의 띄어쓰기가 모두 유지돼야 한다")
+        self.assertEqual(L.composed, "hi OUT ")
+
+
+# ── 로그인 시 자동 실행(작업 스케줄러) ─────────────────────────────
+class TestStartupTaskXml(unittest.TestCase):
+    """schtasks /SC ONLOGON 으로 만든 작업은 기본값이
+    DisallowStartIfOnBatteries=true 라, 노트북을 배터리로 쓰면 로그인해도
+    조용히 실행되지 않는다(= '자동 실행 켜놨는데 부팅 시 안 켜짐'의 원인).
+    그래서 작업을 XML 로 만들고, 그 XML 이 필요한 값을 담고 있는지 검증한다."""
+
+    def test_battery_restrictions_are_off(self):
+        xml = main._startup_task_xml()
+        self.assertIn("<DisallowStartIfOnBatteries>false", xml)
+        self.assertIn("<StopIfGoingOnBatteries>false", xml)
+
+    def test_no_execution_time_limit(self):
+        # 상주 프로그램이 기본 72시간 뒤 강제 종료되지 않도록 무제한
+        self.assertIn("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+                      main._startup_task_xml())
+
+    def test_runs_elevated_in_user_session(self):
+        xml = main._startup_task_xml()
+        self.assertIn("<RunLevel>HighestAvailable</RunLevel>", xml)
+        self.assertIn("<LogonType>InteractiveToken</LogonType>", xml)
+        self.assertIn("<LogonTrigger>", xml)
+
+    def test_command_matches_current_target(self):
+        exe, args = main._startup_target_parts()
+        xml = main._startup_task_xml()
+        self.assertIn(f"<Command>{exe}</Command>", xml)
+        if args:
+            self.assertIn("<Arguments>", xml)
+
+    def test_xml_escapes_special_chars(self):
+        real = main._startup_target_parts
+        main._startup_target_parts = lambda: (r"C:\a&b\App.exe", "<x>")
+        try:
+            xml = main._startup_task_xml()
+        finally:
+            main._startup_target_parts = real
+        self.assertIn("C:\\a&amp;b\\App.exe", xml)
+        self.assertIn("&lt;x&gt;", xml)
+
+
+class TestSetStartupFallbacks(unittest.TestCase):
+    """등록은 XML → /SC ONLOGON → 레지스트리 Run 순으로 시도하고,
+    실패 사유를 남겨 사용자에게 보여줄 수 있어야 한다."""
+
+    def setUp(self):
+        self._run = main._run_quiet
+        self._reg = main._set_run_entry
+        self.calls = []
+        self.reg_calls = []
+        main._set_run_entry = lambda enabled: (self.reg_calls.append(enabled),
+                                               True)[1]
+
+    def tearDown(self):
+        main._run_quiet = self._run
+        main._set_run_entry = self._reg
+
+    def _fake_run(self, results):
+        """results: 명령의 특징 문자열 → (rc, err) 매핑."""
+        def run(cmd):
+            self.calls.append(cmd)
+            key = "xml" if "/XML" in cmd else (
+                "create" if "/Create" in cmd else
+                "delete" if "/Delete" in cmd else "query")
+            return results.get(key, (0, ""))
+        return run
+
+    def test_xml_path_is_preferred(self):
+        main._run_quiet = self._fake_run({})
+        self.assertTrue(main.set_startup(True))
+        self.assertTrue(any("/XML" in c for c in self.calls),
+                        "먼저 XML 로 등록을 시도한다")
+        self.assertNotIn("/SC", [a for c in self.calls for a in c],
+                         "XML 이 성공하면 구형 방식은 쓰지 않는다")
+        self.assertEqual(self.reg_calls, [False],
+                         "작업 등록에 성공하면 Run 항목은 지운다(중복 실행 방지)")
+
+    def test_falls_back_to_onlogon_then_run(self):
+        main._run_quiet = self._fake_run({"xml": (1, "XML 거부"),
+                                          "create": (1, "권한 없음")})
+        self.assertTrue(main.set_startup(True), "최후엔 Run 으로라도 등록한다")
+        self.assertTrue(any("/XML" in c for c in self.calls))
+        self.assertTrue(any("/SC" in c for c in self.calls))
+        self.assertIn(True, self.reg_calls, "Run 폴백까지 갔다")
+        self.assertTrue(main.startup_last_error(), "실패 사유가 남는다")
+
+    def test_all_paths_fail(self):
+        main._run_quiet = self._fake_run({"xml": (1, "e1"), "create": (1, "e2")})
+        main._set_run_entry = lambda enabled: False
+        self.assertFalse(main.set_startup(True))
+        self.assertTrue(main.startup_last_error())
+
+    def test_disable_removes_task_and_run_entry(self):
+        main._run_quiet = self._fake_run({})
+        self.assertTrue(main.set_startup(False))
+        self.assertTrue(any("/Delete" in c for c in self.calls))
+        self.assertEqual(self.reg_calls, [False])
+
+
+class TestStartupSelfHealing(unittest.TestCase):
+    """설정이 '자동 실행 켬'인데 실제 등록이 없거나 낡은 경로를 가리키면,
+    앱을 켤 때 조용히 다시 등록해야 한다. (작업이 지워졌거나 새 버전 exe 로
+    갈아탄 경우 사용자는 계속 '켜져 있다'고 보면서 부팅 때만 안 뜬다)"""
+
+    def setUp(self):
+        self._state = main.startup_state
+        self._set = main.set_startup
+        self.registered = []
+        main.set_startup = lambda v: (self.registered.append(v), True)[1]
+
+    def tearDown(self):
+        main.startup_state = self._state
+        main.set_startup = self._set
+
+    def _state_is(self, **kw):
+        base = {"registered": True, "kind": "task", "command": "x",
+                "stale": False}
+        base.update(kw)
+        main.startup_state = lambda: base
+
+    def test_reregisters_when_task_is_missing(self):
+        self._state_is(registered=False, kind=None, command=None)
+        self.assertTrue(main.ensure_startup({"startup": True}))
+        self.assertEqual(self.registered, [True])
+
+    def test_reregisters_when_path_is_stale(self):
+        self._state_is(stale=True)
+        self.assertTrue(main.ensure_startup({"startup": True}))
+        self.assertEqual(self.registered, [True])
+
+    def test_upgrades_run_fallback_to_task(self):
+        self._state_is(kind="run")
+        self.assertTrue(main.ensure_startup({"startup": True}))
+
+    def test_noop_when_healthy(self):
+        self._state_is()
+        self.assertFalse(main.ensure_startup({"startup": True}))
+        self.assertEqual(self.registered, [])
+
+    def test_noop_when_setting_off(self):
+        self._state_is(registered=False)
+        self.assertFalse(main.ensure_startup({"startup": False}))
+        self.assertFalse(main.ensure_startup({}))
+        self.assertEqual(self.registered, [])
+
+    def test_setting_key_exists_with_safe_default(self):
+        self.assertIn("startup", main.DEFAULT_SETTINGS)
+        self.assertFalse(main.DEFAULT_SETTINGS["startup"])
+
+
+# ── 한글 조합(IME preedit) 중 치환: 앞 띄어쓰기 보존 ────────────────
+class TestComposingTailDetection(unittest.TestCase):
+    """한글 모드로 단축어를 치면 마지막 글자가 IME '조합 중'(preedit) 상태다.
+    조합 중인 글자는 아직 문서에 들어가 있지 않아서, 백스페이스를 그냥 보내면
+    앱에 따라 그 글자가 백스페이스를 소비하지 않고 사라진다 → 보낸 백스페이스가
+    전부 확정된 앞 글자에 꽂혀 **단축어 앞의 띄어쓰기까지 지워진다**
+    ("안녕. ;;cl" 을 한글 모드로 치면 "안녕.결과").
+
+    그래서 주입 직전에 조합을 확정시켜야 하고, 그러려면 '지금 조합 중인지'를
+    치환 계산 단계에서 알려 줘야 한다."""
+
+    def test_is_jamo(self):
+        for ch in ("ㅊ", "ㅣ", "ㅏ", "ㄴ"):
+            self.assertTrue(main.is_jamo(ch), ch)
+        for ch in ("치", "a", ";", " ", "1", "", "가"):
+            self.assertFalse(main.is_jamo(ch), repr(ch))
+
+    def _sim(self, trigger, output=";;OUT"):
+        return _ScreenSim({"type": "special", "trigger": trigger,
+                           "output": output, "enabled": True}, normalize=True)
+
+    def _type_raw(self, sim, chars):
+        for ch in chars:
+            sim.raw += ch
+            sim.L._on_press(_FakeCharKey(ch))
+        return sim
+
+    def test_korean_mode_trigger_is_flagged_composing(self):
+        # 한글 모드로 ";;cl" → 실제로는 ';', ';', 'ㅊ', 'ㅣ' 가 들어온다.
+        s = self._sim(";;cl", "결과")
+        s.type_jamo("안녕. ")
+        self._type_raw(s, ";;ㅊㅣ")
+        self.assertTrue(s.cap.get("composing"),
+                        "마지막 글자가 자모면 조합 중으로 보고해야 한다")
+        self.assertEqual(s.cap.get("bs"), 3, '화면상 ";;치" 3글자')
+        self.assertEqual(s.screen_after(), "안녕. 결과",
+                         "앞의 띄어쓰기가 남아야 한다")
+
+    def test_english_mode_trigger_is_not_composing(self):
+        s = self._sim(";;cl", "결과")
+        s.type_jamo("안녕. ")
+        self._type_raw(s, ";;cl")
+        self.assertFalse(s.cap.get("composing"),
+                         "영문 입력은 조합이 없다 → 확정 절차 불필요")
+        self.assertEqual(s.screen_after(), "안녕. 결과")
+
+    def test_completed_syllable_trigger_is_not_composing(self):
+        # 트리거가 완성형으로 끝나면(예: 뒤에 확정을 부른 입력이 있었던 경우)
+        # 조합 중이 아니다.
+        s = self._sim(";;가", "결과")
+        s.type_jamo("안녕. ")
+        self._type_raw(s, ";;")
+        s.raw += "가"
+        s.L._on_press(_FakeCharKey("가"))
+        self.assertFalse(s.cap.get("composing"))
+
+
+class TestImeCommitBeforeBackspace(unittest.TestCase):
+    """주입 스레드는 백스페이스보다 **먼저** 조합을 확정시켜야 한다.
+    확정 수단은 두 가지: (1) IME 변환모드를 영문으로(메시지 방식),
+    (2) 그 메시지를 무시하는 앱을 위해 진짜 한/영 키. 끝나면 원복한다."""
+
+    def setUp(self):
+        self.order = []
+        self._force = main.ime_force_alphanumeric
+        self._restore = main.ime_restore
+        self._toggle = main.send_hangul_toggle
+        self._send = main.send_text
+        main.send_text = lambda *a, **k: (self.order.append("type"), True)[1]
+        main.ime_restore = lambda saved: self.order.append("restore")
+        main.send_hangul_toggle = lambda: (self.order.append("toggle"), True)[1]
+
+    def tearDown(self):
+        main.ime_force_alphanumeric = self._force
+        main.ime_restore = self._restore
+        main.send_hangul_toggle = self._toggle
+        main.send_text = self._send
+
+    def _listener(self):
+        L = main.KeyboardListener()
+        L.controller = _RecordingController(self.order)
+        return L
+
+    def test_mode_switch_commits_before_backspaces(self):
+        main.ime_force_alphanumeric = lambda: (self.order.append("force"),
+                                               ("ime", 1))[1]
+        L = self._listener()
+        L._inject_replacement("t", "OUT", "OUT", 2, composing=True)
+        self.assertLess(self.order.index("force"), self.order.index("bs"),
+                        "조합 확정이 백스페이스보다 먼저여야 한다")
+        self.assertIn("restore", self.order)
+        self.assertNotIn("toggle", self.order,
+                         "메시지 방식이 통했으면 한/영 키는 누르지 않는다")
+
+    def test_hangul_key_fallback_when_mode_switch_fails(self):
+        main.ime_force_alphanumeric = lambda: None  # Chromium 등: 메시지 무시
+        L = self._listener()
+        L._inject_replacement("t", "OUT", "OUT", 2, composing=True)
+        self.assertEqual(self.order.count("toggle"), 2,
+                         "확정용 한 번 + 원복용 한 번")
+        self.assertLess(self.order.index("toggle"), self.order.index("bs"))
+
+    def test_no_toggle_when_not_composing(self):
+        main.ime_force_alphanumeric = lambda: None
+        L = self._listener()
+        L._inject_replacement("t", "OUT", "OUT", 2, composing=False)
+        self.assertNotIn("toggle", self.order,
+                         "조합이 없으면 한/영 키를 건드리지 않는다")
+
+
+class _RecordingController:
+    """pynput Controller 대역 — 백스페이스 순서만 기록한다."""
+
+    def __init__(self, order):
+        self.order = order
+
+    def press(self, key):
+        if key == main.Key.backspace and "bs" not in self.order:
+            self.order.append("bs")
+
+    def release(self, key):
+        pass
+
+    def type(self, text):
+        self.order.append("type")
 
 
 if __name__ == "__main__":

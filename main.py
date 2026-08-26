@@ -22,7 +22,7 @@ from pynput.keyboard import Key, Controller
 import ctypes
 
 # 앱 버전 (SemVer). 릴리스 태그 v<버전> 과 일치시킨다.
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 
 
 # ── 유니코드 직접 주입 (Windows SendInput) ───────────────────────
@@ -255,6 +255,19 @@ if sys.platform == "win32":
             pass
         return None
 
+    # 한/영 키(VK_HANGUL). WM_IME_CONTROL 을 무시하는 앱(Chromium 계열 등)
+    # 에서도 "진짜 키"는 IME 가 반드시 처리하므로, 조합 중인 글자를 확정시키는
+    # 최후 수단으로 쓴다. 누르면 한/영 모드가 바뀌므로 반드시 짝으로 되돌린다.
+    _VK_HANGUL = 0x15
+
+    def send_hangul_toggle() -> bool:
+        """한/영 키를 한 번 눌렀다 뗀다. 조합 중이던 글자가 확정된다."""
+        scan = _MapVirtualKeyW(_VK_HANGUL, 0)
+        return _send_key_inputs([
+            (_VK_HANGUL, scan, 0),
+            (_VK_HANGUL, scan, _KEYEVENTF_KEYUP),
+        ])
+
     def ime_restore(saved):
         """ime_force_alphanumeric 가 돌려준 상태로 IME 변환모드를 복원."""
         if not saved:
@@ -311,6 +324,19 @@ if sys.platform == "win32":
         except Exception:
             return False
 
+    # ── 사용자가 눌렀던 키를 그대로 다시 보내기 ───────────────────
+    # 치환 주입 중에 전역 차단한 사용자 키를, 치환이 끝난 뒤 순서대로
+    # 되돌려준다(뒤에 이어 친 띄어쓰기 등이 사라지지 않게).
+    _KEYEVENTF_EXTENDEDKEY = 0x0001
+
+    def send_key_events(events) -> bool:
+        """events: 후크에서 받은 (wVk, wScan, dwFlags) 리스트를 그대로 재전송.
+        가상키로 보내므로 IME(한/영) 상태에 따른 해석이 사용자가 실제로 쳤을
+        때와 같아진다."""
+        if not events:
+            return True
+        return _send_key_inputs(events)
+
     # ── 단일 실행 보장 (named mutex) ──────────────────────────────
     # QSharedMemory 는 강제종료/크래시 시 잠금이 OS 에 남아(leak) 다음 실행을
     # 영구히 "이미 실행 중"으로 막는 문제가 있다. named mutex 는 소유 프로세스가
@@ -341,6 +367,9 @@ else:
     def ime_force_alphanumeric():
         return None
 
+    def send_hangul_toggle() -> bool:
+        return False
+
     def ime_restore(saved):
         return None
 
@@ -348,6 +377,14 @@ else:
         return "(non-win32)"
 
     def foreground_needs_scancode() -> bool:
+        return False
+
+    # win32 쪽과 이름을 맞춰 둔다(플랫폼 무관 코드에서 참조 가능).
+    _KEYEVENTF_KEYUP = 0x0002
+    _KEYEVENTF_EXTENDEDKEY = 0x0001
+
+    def send_key_events(events) -> bool:
+        """비-Windows: 키 재생 미지원(전역 차단도 win32 후크에서만 한다)."""
         return False
 
     def acquire_single_instance(name=None):
@@ -414,6 +451,10 @@ DEFAULT_SETTINGS = {
     "notifications_enabled": True,
     # 켜면 키 감지·치환·주입 과정을 keyflux_debug.log 에 기록한다(진단용).
     "debug_log": False,
+    # "로그인 시 자동 실행"을 사용자가 켜 뒀는지. 실제 등록 상태(작업 스케줄러)
+    # 와 별개로 의도를 남겨 두고, 시작할 때마다 ensure_startup() 이 둘을 맞춘다
+    # (작업이 지워졌거나 exe 를 옮겨 경로가 낡은 경우 조용히 재등록).
+    "startup": False,
 }
 
 def load_settings():
@@ -516,66 +557,300 @@ def _no_window_kwargs() -> dict:
         kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
     return kw
 
-def _startup_target_command() -> str:
-    """시작 시 실행할 명령 문자열.
-    - frozen(PyInstaller exe): exe 경로 자체
+def _startup_target_parts():
+    """시작 시 실행할 (실행파일, 인자) 쌍.
+    - frozen(PyInstaller exe): exe 자체, 인자 없음
     - 스크립트 실행: pythonw(콘솔 없는 인터프리터) + main.py 경로"""
     if getattr(sys, "frozen", False):
-        return f'"{Path(sys.executable)}"'
+        return str(Path(sys.executable)), ""
     pyw = Path(sys.executable).with_name("pythonw.exe")
     launcher = pyw if pyw.exists() else Path(sys.executable)
-    return f'"{launcher}" "{Path(__file__).resolve()}"'
+    return str(launcher), f'"{Path(__file__).resolve()}"'
 
-def _remove_legacy_run_entry():
-    """과거 버전이 남긴 HKCU\\Run 자동시작 항목 제거(작업 스케줄러로 이관)."""
+
+def _startup_target_command() -> str:
+    """시작 시 실행할 명령 문자열(schtasks /TR 형식)."""
+    exe, args = _startup_target_parts()
+    return f'"{exe}"' + (f" {args}" if args else "")
+
+
+def _current_user_id() -> str:
+    """작업을 실행할 사용자 계정(DOMAIN\\user). 알 수 없으면 사용자명만."""
+    domain = os.environ.get("USERDOMAIN") or os.environ.get("COMPUTERNAME") or ""
+    user = os.environ.get("USERNAME") or ""
+    return f"{domain}\\{user}" if domain and user else user
+
+
+def _startup_task_xml() -> str:
+    """자동시작 작업의 XML 정의.
+
+    schtasks /Create /SC ONLOGON 으로 만든 작업은 **배터리 관련 기본값**이
+    켜져 있어서(전원 연결 시에만 시작), 노트북을 배터리로 쓰면 로그인해도
+    작업이 조용히 실행되지 않는다. 이 기본값은 /SC 방식으로는 끌 수 없고 XML
+    로만 지정할 수 있으므로, 작업을 XML 로 만든다.
+
+    함께 지정하는 것들:
+      - DisallowStartIfOnBatteries / StopIfGoingOnBatteries = false
+        → 배터리로 켜도 시작되고, 도중에 전원이 빠져도 죽지 않는다.
+      - ExecutionTimeLimit = PT0S (무제한)
+        → 상주 프로그램이 3일(기본 72시간) 뒤 강제 종료되지 않는다.
+      - StartWhenAvailable = true, RestartOnFailure
+        → 로그인 시점에 못 뜨면 조금 뒤 다시 시도한다.
+      - RunLevel HighestAvailable + InteractiveToken
+        → 관리자 권한으로, UAC 창 없이, 사용자 세션에서 실행된다.
+    """
+    exe, args = _startup_target_parts()
+    user = _current_user_id()
+    esc = lambda s: (s.replace("&", "&amp;").replace("<", "&lt;")
+                     .replace(">", "&gt;"))
+    arg_el = f"\n      <Arguments>{esc(args)}</Arguments>" if args else ""
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>KeyFlux - 키 입력 자동 변환기 (로그인 시 자동 실행)</Description>
+    <URI>\\{_TASK_NAME}</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{esc(user)}</UserId>
+      <Delay>PT5S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{esc(user)}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>false</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{esc(exe)}</Command>{arg_el}
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+
+def _run_quiet(cmd):
+    """콘솔 창 없이 명령 실행. (returncode, stderr) 반환. 실패 시 (-1, 사유)."""
+    try:
+        import subprocess
+        r = subprocess.run(cmd, **_no_window_kwargs())
+        return r.returncode, (r.stderr or r.stdout or "").strip()
+    except Exception as e:
+        return -1, repr(e)
+
+
+def _set_run_entry(enabled: bool) -> bool:
+    """HKCU\\Run 자동시작 항목 등록/해제.
+
+    작업 스케줄러 등록이 실패했을 때의 **최후 폴백**이다. Run 항목은 승격
+    실행을 하지 못하므로(=관리자 권한 없이 뜬다) 관리자 권한 앱에서는 후킹이
+    제한될 수 있지만, "아예 안 뜨는 것" 보다는 낫다.
+    """
     if sys.platform != "win32":
-        return
+        return False
     try:
         import winreg
+        if enabled:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
+                winreg.SetValueEx(key, _RUN_VALUE, 0, winreg.REG_SZ,
+                                  _startup_target_command())
+            return True
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
                             winreg.KEY_SET_VALUE) as key:
             try:
                 winreg.DeleteValue(key, _RUN_VALUE)
             except FileNotFoundError:
                 pass
+        return True
     except OSError:
-        pass
+        return False
+
+
+def _remove_legacy_run_entry():
+    """과거 버전이 남긴 HKCU\\Run 자동시작 항목 제거(작업 스케줄러로 이관)."""
+    _set_run_entry(False)
+
+
+def _registered_task_command():
+    """등록된 작업이 실행하도록 돼 있는 명령. 작업이 없으면 None."""
+    if sys.platform != "win32":
+        return None
+    code, out = _run_quiet(["schtasks", "/Query", "/TN", _TASK_NAME, "/XML"])
+    if code != 0 or not out:
+        return None
+    try:
+        cmd = re.search(r"<Command>(.*?)</Command>", out, re.S)
+        args = re.search(r"<Arguments>(.*?)</Arguments>", out, re.S)
+    except Exception:
+        return None
+    if not cmd:
+        return ""
+    parts = f'"{cmd.group(1).strip()}"'
+    if args and args.group(1).strip():
+        parts += " " + args.group(1).strip()
+    return parts
+
 
 def is_startup_enabled() -> bool:
-    """작업 스케줄러에 KeyFlux 자동시작 작업이 등록돼 있는지(실제 상태)."""
+    """자동시작이 실제로 등록돼 있는지(작업 스케줄러 또는 Run 폴백)."""
     if sys.platform != "win32":
         return False
+    code, _ = _run_quiet(["schtasks", "/Query", "/TN", _TASK_NAME])
+    if code == 0:
+        return True
     try:
-        import subprocess
-        r = subprocess.run(["schtasks", "/Query", "/TN", _TASK_NAME],
-                           **_no_window_kwargs())
-        return r.returncode == 0
-    except Exception:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
+            winreg.QueryValueEx(key, _RUN_VALUE)
+        return True
+    except OSError:
         return False
 
-def set_startup(enabled: bool) -> bool:
-    """자동시작 작업 등록/해제(최고 권한). 성공 시 True.
-    작업 생성/삭제에는 관리자 권한이 필요하다(앱이 관리자로 실행되므로 충족)."""
+
+def startup_state() -> dict:
+    """자동시작의 실제 상태.
+
+    {"registered": bool, "kind": "task"|"run"|None, "command": str|None,
+     "stale": bool}  — stale 은 "등록은 돼 있지만 다른 경로(옛 exe 위치 등)를
+    가리켜서, 그대로 두면 로그인해도 실행되지 않는" 상태를 뜻한다.
+    """
     if sys.platform != "win32":
-        return False
+        return {"registered": False, "kind": None, "command": None,
+                "stale": False}
+    want = _startup_target_command()
+    cmd = _registered_task_command()
+    if cmd is not None:
+        return {"registered": True, "kind": "task", "command": cmd,
+                "stale": cmd.lower() != want.lower()}
     try:
-        import subprocess
-        if enabled:
-            _remove_legacy_run_entry()  # 옛 Run 항목과 중복 방지
-            r = subprocess.run(
-                ["schtasks", "/Create", "/TN", _TASK_NAME,
-                 "/TR", _startup_target_command(),
-                 "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"],
-                **_no_window_kwargs())
-            return r.returncode == 0
-        else:
-            r = subprocess.run(["schtasks", "/Delete", "/TN", _TASK_NAME, "/F"],
-                              **_no_window_kwargs())
-            _remove_legacy_run_entry()
-            # 작업이 원래 없었어도 "해제됨"으로 간주
-            return r.returncode == 0 or not is_startup_enabled()
-    except Exception:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
+            val = winreg.QueryValueEx(key, _RUN_VALUE)[0]
+        return {"registered": True, "kind": "run", "command": val,
+                "stale": val.lower() != want.lower()}
+    except OSError:
+        return {"registered": False, "kind": None, "command": None,
+                "stale": False}
+
+
+# 마지막 등록 시도에서 OS 가 돌려준 실패 사유(설정 창에 그대로 보여준다).
+_startup_last_error = ""
+
+
+def startup_last_error() -> str:
+    return _startup_last_error
+
+
+def set_startup(enabled: bool) -> bool:
+    """자동시작 등록/해제. 성공하면 True.
+
+    등록은 세 단계로 시도한다(앞이 실패하면 다음으로):
+      1. 작업 스케줄러 + XML  — 배터리 상태와 무관하게 로그인 시 실행되고,
+         관리자 권한(UAC 창 없음)으로 뜬다. 정상 경로.
+      2. 작업 스케줄러 /SC ONLOGON — XML 을 못 쓰는 환경용(구형 schtasks).
+      3. HKCU\\Run — 작업 스케줄러 자체가 막힌 경우의 최후 수단(비승격 실행).
+    실패 사유는 startup_last_error() 로 확인할 수 있다.
+    """
+    global _startup_last_error
+    _startup_last_error = ""
+    if sys.platform != "win32":
+        _startup_last_error = "Windows 에서만 지원합니다."
         return False
+
+    if not enabled:
+        code, err = _run_quiet(["schtasks", "/Delete", "/TN", _TASK_NAME, "/F"])
+        _set_run_entry(False)
+        if code != 0 and is_startup_enabled():
+            _startup_last_error = err
+            return False
+        return True
+
+    # 1) XML 로 작업 등록 (배터리 제약 해제 등 세부 설정 포함)
+    tmp = None
+    try:
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix=".xml", prefix="keyflux_task_")
+        os.close(fd)
+        # schtasks /XML 은 UTF-16(BOM 포함) 파일을 요구한다.
+        with open(tmp, "w", encoding="utf-16") as f:
+            f.write(_startup_task_xml())
+        code, err = _run_quiet(["schtasks", "/Create", "/TN", _TASK_NAME,
+                                "/XML", tmp, "/F"])
+        if code == 0:
+            _set_run_entry(False)  # 중복 실행 방지
+            dbg("startup: task registered via XML")
+            return True
+        _startup_last_error = err
+        dbg(f"startup: XML register failed rc={code} err={err!r}")
+    except Exception as e:
+        _startup_last_error = repr(e)
+        dbg(f"startup: XML register error {e!r}")
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    # 2) 구형 방식 (배터리 기본값 제약이 남지만 없는 것보다 낫다)
+    code, err = _run_quiet(["schtasks", "/Create", "/TN", _TASK_NAME,
+                            "/TR", _startup_target_command(),
+                            "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"])
+    if code == 0:
+        _set_run_entry(False)
+        dbg("startup: task registered via /SC ONLOGON")
+        return True
+    _startup_last_error = err or _startup_last_error
+
+    # 3) 최후 폴백 — 레지스트리 Run
+    if _set_run_entry(True):
+        dbg("startup: fell back to HKCU\\Run")
+        return True
+    return False
+
+
+def ensure_startup(settings) -> bool:
+    """설정에서 "자동 실행 켬"으로 저장돼 있으면, 실제 등록 상태를 확인해
+    필요할 때 조용히 다시 등록한다(자가 치유).
+
+    이게 없으면 작업이 지워지거나(정리 도구·계정 변경) exe 를 다른 위치로
+    옮겨 등록된 경로가 낡아도, 사용자는 여전히 "켜져 있다"고 보면서 부팅 때만
+    안 뜨는 상태가 된다. 다시 등록했으면 True.
+    """
+    if sys.platform != "win32" or not settings.get("startup"):
+        return False
+    state = startup_state()
+    if state["registered"] and not state["stale"] and state["kind"] == "task":
+        return False
+    dbg(f"startup: re-registering (state={state})")
+    return set_startup(True)
 
 # ── 디버그 로깅 ──────────────────────────────────────────────────
 # "특정 터미널에서 단축어가 안 되는" 문제를, '감지가 됐는지 / 주입이 갔는지'
@@ -884,6 +1159,14 @@ def _norm_char(ch: str) -> str:
     return ch
 
 
+def is_jamo(ch: str) -> bool:
+    """한글 자모(조합 중일 수 있는 글자)인가. 호환 자모/현대 자모 모두."""
+    if not ch:
+        return False
+    o = ord(ch)
+    return 0x3131 <= o <= 0x318E or 0x1100 <= o <= 0x11FF
+
+
 def normalize_keyseq(s: str) -> str:
     """문자열 전체를 물리 키 시퀀스로 정규화."""
     return "".join(_norm_char(c) for c in s)
@@ -925,6 +1208,11 @@ class KeyboardListener(QObject):
         self._suppress_until = 0.0
         # _do_replace 실행 중 재귀적으로 다시 호출되는 것을 막는 플래그
         self._replacing = False
+        # 치환 주입 동안 전역 차단한 사용자 키 이벤트 큐.
+        # 차단은 하되 "버리지" 않고, 치환이 끝난 뒤 순서대로 되돌려준다
+        # → 단축어 뒤에 바로 친 띄어쓰기/글자가 사라지지 않는다.
+        self._blocked_keys = []
+        self._replay_timer = None
 
         # ── 빠른 필터링용 인덱스 (set_rules에서 갱신) ──────────────
         # 매 키 입력마다 모든 규칙을 endswith()로 검사하지 않고,
@@ -1074,6 +1362,9 @@ class KeyboardListener(QObject):
             self._suppress_until = 0.0
             self._pending = None
             self._capturing = None
+            # 꺼진 상태에서는 차단도 하지 않으므로, 남아 있던 차단분을
+            # 나중에 엉뚱한 시점에 되돌려주지 않도록 버린다.
+            self._blocked_keys = []
 
     def _on_press(self, key):
         if not self.active:
@@ -1417,6 +1708,16 @@ class KeyboardListener(QObject):
             consumed_raw = len(trigger) if via == "raw" else self._consumed_raw_for(trigger)
         consumed_raw = max(0, min(consumed_raw, len(self.buffer)))
 
+        # 트리거의 마지막 글자가 한글 자모면, 그 글자는 지금 IME 가 "조합 중"
+        # 일 가능성이 높다. 조합 중인 글자는 아직 문서에 들어가지 않은 채
+        # 화면에만 떠 있어서(preedit), 백스페이스를 보내면 앱에 따라 그 글자가
+        # 백스페이스를 소비하지 않고 그냥 사라진다 → 보낸 백스페이스가 전부
+        # 확정된 앞 글자에 꽂혀 **단축어 앞의 띄어쓰기까지 지워진다**.
+        # (예: 한글 모드로 "안녕. ;;cl" → 화면 "안녕. ;;치", 치가 조합 중.
+        #  bs 3개가 ";;" 와 공백을 지워 "안녕.결과" 가 됨)
+        # 그래서 주입 스레드가 백스페이스 전에 조합을 확정시키도록 알려 준다.
+        composing = is_jamo(self.buffer[-1:]) if consumed_raw else False
+
         # ── 화면(조합형) 기준으로 실제 지워야 할 글자 수를 정확히 계산 ──────
         # 트리거를 치기 '전' 화면(before)과 '후' 화면(after)을 비교한다.
         # 보통은 트리거가 새로 추가한 글자 수만 지우면 되지만, 한글 조합 경계에서
@@ -1466,19 +1767,38 @@ class KeyboardListener(QObject):
 
         dbg(f"REPLACE trig={trigger!r} via={via} cr={consumed_raw} "
             f"bs={backspace_count} reinject={reinject!r} to_type={to_type!r} "
-            f"fg={foreground_window_info()}")
+            f"composing={composing} fg={foreground_window_info()}")
 
         # 실제 키 입력 주입은 백그라운드 스레드에서 처리한다.
         # 1) 후킹 콜백을 즉시 반환시켜 다른 키 입력을 막지(블로킹) 않음
         # 2) 백스페이스 → (지연) → 붙여넣기 순서로 보내 race condition 방지
         threading.Thread(
             target=self._inject_replacement,
-            args=(trigger, to_type, resolved, backspace_count),
+            args=(trigger, to_type, resolved, backspace_count, composing),
             daemon=True,
         ).start()
 
-    def _inject_replacement(self, trigger: str, to_type: str, resolved: str, backspace_count: int):
+    def _inject_replacement(self, trigger: str, to_type: str, resolved: str,
+                            backspace_count: int, composing: bool = False):
+        saved_ime = None
+        toggled = False
         try:
+            # 0) 백스페이스를 보내기 전에 "조합 중인 글자"를 확정시킨다.
+            #    확정 전에는 그 글자가 문서에 없어서(IME preedit) 백스페이스가
+            #    몇 개 먹히는지 앱마다 다르고, 대개 한 글자를 더 지워 단축어
+            #    앞의 띄어쓰기가 사라진다. 확정하고 나면 백스페이스 1개 = 화면
+            #    1글자로 계산이 맞아떨어진다.
+            #    (a) IME 변환모드를 영문으로 바꾸면 조합이 확정된다. 메시지
+            #        방식이라 화면 깜빡임이 없고, 주입 중 자모 간섭도 막아 준다.
+            #    (b) Chromium 계열처럼 그 메시지를 무시하는 앱에서는 진짜
+            #        한/영 키를 눌러 확정시킨다(끝나고 다시 눌러 원복).
+            saved_ime = ime_force_alphanumeric()
+            if composing and not saved_ime:
+                toggled = send_hangul_toggle()
+            if saved_ime or toggled:
+                time.sleep(0.01)  # 확정이 반영될 짧은 시간
+            dbg(f"inject ime_commit forced={bool(saved_ime)} toggled={toggled}")
+
             # 1) 화면에 보이는 글자 수(backspace_count)만큼 백스페이스를
             #    "한 글자씩" 보내고, 대상 앱이 처리할 시간을 준다.
             #    (단일 키의 반복이라 순서가 뒤섞일 일이 없음.
@@ -1512,20 +1832,14 @@ class KeyboardListener(QObject):
             #    어느 쪽이든 줄바꿈/탭은 '진짜 키'로, 못 치는 글자(한글 등)는
             #    유니코드로 처리된다. 클립보드는 건드리지 않는다.
             if foreground_needs_scancode():
-                saved_ime = ime_force_alphanumeric()
+                # IME 는 위(0단계)에서 이미 영문으로 돌려 두었다(조합 확정 겸용).
                 dbg(f"inject via=scancode ime_forced={bool(saved_ime)}")
-                try:
-                    if saved_ime:
-                        # IME 모드 전환이 반영될 시간을 짧게 준다
-                        time.sleep(0.01)
-                    ok = send_text(to_type, case_guarantee=self.case_guarantee)
-                    dbg(f"send_text ok={ok} case_guarantee={self.case_guarantee}")
-                    if not ok:
-                        # 폴백: 비-Windows이거나 주입 실패 시 pynput 타이핑
-                        self.controller.type(to_type)
-                        dbg("fallback pynput type used")
-                finally:
-                    ime_restore(saved_ime)
+                ok = send_text(to_type, case_guarantee=self.case_guarantee)
+                dbg(f"send_text ok={ok} case_guarantee={self.case_guarantee}")
+                if not ok:
+                    # 폴백: 비-Windows이거나 주입 실패 시 pynput 타이핑
+                    self.controller.type(to_type)
+                    dbg("fallback pynput type used")
             else:
                 # 유니코드 직접 주입 (IME 미경유 → 언어 보존·Chromium 호환)
                 ok = send_text(to_type, case_guarantee=self.case_guarantee,
@@ -1539,7 +1853,16 @@ class KeyboardListener(QObject):
 
             self.status_changed.emit(f'"{trigger}" → "{resolved}"')
         finally:
+            # 키워드를 치기 전의 한/영 상태로 되돌린다(0단계에서 바꿨다면).
+            ime_restore(saved_ime)
+            if toggled:
+                send_hangul_toggle()
             self._replacing = False
+            # 치환 중에 사용자가 친 키(뒤에 이어 친 띄어쓰기 등)를 돌려준다.
+            try:
+                self._replay_blocked_keys()
+            except Exception as e:
+                dbg(f"REPLAY error {e!r}")
 
     # Windows 저수준 후크 플래그: 이 키 이벤트가 SendInput 등으로 "주입"된
     # 것임을 나타낸다. 우리 치환 주입(백스페이스·유니코드/스캔코드 텍스트)은
@@ -1566,6 +1889,76 @@ class KeyboardListener(QObject):
             f"flags={getattr(data, 'flags', 0):#x}")
         return True
 
+    # 후크가 알려주는 원본 이벤트 플래그/메시지
+    _LLKHF_EXTENDED = 0x01
+    _WM_KEYUP_MSGS = (0x0101, 0x0105)   # WM_KEYUP, WM_SYSKEYUP
+    _MAX_BLOCKED_KEYS = 64              # 폭주 방지 상한(키 32개 분량)
+
+    def _queue_blocked_key(self, msg, data):
+        """차단한 사용자 키를 나중에 그대로 다시 보내려고 적어 둔다.
+        (wVk, wScan, dwFlags) 형태로, 눌림/뗌과 확장키 여부까지 보존한다."""
+        if len(self._blocked_keys) >= self._MAX_BLOCKED_KEYS:
+            return
+        try:
+            vk = int(data.vkCode)
+            scan = int(getattr(data, "scanCode", 0) or 0)
+            src = int(getattr(data, "flags", 0) or 0)
+        except Exception:
+            return
+        flags = 0
+        if src & self._LLKHF_EXTENDED:
+            flags |= _KEYEVENTF_EXTENDEDKEY
+        if msg in self._WM_KEYUP_MSGS:
+            flags |= _KEYEVENTF_KEYUP
+        self._blocked_keys.append((vk, scan, flags))
+        self._schedule_replay()
+
+    def _schedule_replay(self):
+        """차단분을 되돌려줄 시점을 예약한다.
+
+        주입 스레드가 끝나면 거기서 곧바로 되돌려주지만, 주입이 끝난 뒤에도
+        억제 시간(_suppress_until)이 조금 남아 있는 구간이 있다. 그 사이에
+        차단된 키는 되돌려줄 사람이 없어 그대로 사라지므로(=빠르게 친 뒤쪽
+        띄어쓰기가 없어지던 경로), 억제가 풀리는 시점에 한 번 더 비운다.
+        주입 스레드가 먼저 비웠으면 이 타이머는 빈 큐를 보고 아무 일도 하지
+        않는다."""
+        t = self._replay_timer
+        if t is not None and t.is_alive():
+            return
+        delay = max(0.0, self._suppress_until - time.monotonic()) + 0.005
+        t = threading.Timer(delay, self._flush_blocked_keys)
+        t.daemon = True
+        self._replay_timer = t
+        t.start()
+
+    def _flush_blocked_keys(self):
+        """예약된 시점에 호출 — 아직 주입 중이면 조금 뒤로 미룬다."""
+        try:
+            if self._replacing or time.monotonic() < self._suppress_until:
+                self._replay_timer = None
+                if self._blocked_keys:
+                    self._schedule_replay()
+                return
+            self._replay_blocked_keys()
+        except Exception as e:
+            dbg(f"REPLAY(timer) error {e!r}")
+
+    def _replay_blocked_keys(self):
+        """치환이 끝난 직후, 차단해 뒀던 사용자 키를 순서대로 되돌려준다.
+        - 먼저 억제를 풀어야 재생된 키가 _on_press 를 거쳐 버퍼에도 반영된다
+          (반영되지 않으면 화면과 버퍼가 어긋나 다음 치환의 백스페이스 수가
+          틀어진다).
+        - 재생 이벤트는 '주입' 플래그가 서 있어 _blocking_now 가 통과시키므로
+          스스로 다시 차단되지 않는다."""
+        events = self._blocked_keys
+        self._blocked_keys = []
+        if not events:
+            return
+        self._suppress_until = 0.0
+        dbg(f"REPLAY blocked keys n={len(events)}")
+        if not send_key_events(events):
+            dbg("REPLAY failed (send_key_events)")
+
     def _win32_event_filter(self, msg, data):
         """Windows 저수준 키보드 후크 필터(모든 키 이벤트마다 후크 스레드에서 호출).
         평상시엔 아무 것도 건드리지 않는다. 단 '키워드 → 출력' 치환이 주입되는
@@ -1578,6 +1971,10 @@ class KeyboardListener(QObject):
         않게 해(=return 1) 이벤트가 대상 앱/시스템으로 전파되지 못하게 한다.
         (그래서 여기서 그 예외를 잡으면 안 된다.)"""
         if self._blocking_now(data):
+            # 차단하기 전에 기록해 둔다(suppress_event 는 예외를 던지므로
+            # 반드시 그 앞에서). 치환이 끝나면 _replay_blocked_keys 가
+            # 이 키들을 순서대로 다시 보낸다.
+            self._queue_blocked_key(msg, data)
             self._listener.suppress_event()
         return True
 
@@ -1998,6 +2395,11 @@ class MainWindow(QMainWindow):
         self.settings = load_settings()
         self.variables = load_variables()
         set_debug(self.settings.get("debug_log", False))
+        # "자동 실행 켬"으로 저장돼 있는데 실제 등록이 사라졌거나 낡은 경로를
+        # 가리키면(작업 삭제·exe 이동 등) 여기서 조용히 다시 등록한다.
+        # 이게 없으면 사용자는 계속 "켜져 있다"고 보면서 부팅 때만 안 뜬다.
+        if ensure_startup(self.settings):
+            dbg("startup: re-registered on launch")
         self._apply_style()
         self._init_listener()
         self._build_ui()
@@ -2287,7 +2689,9 @@ class MainWindow(QMainWindow):
         self.startup_chk.setChecked(is_startup_enabled())
         self.startup_chk.setEnabled(sys.platform == "win32")
         self.startup_chk.setToolTip(
-            "켜면 Windows 로그인 시 KeyFlux 가 자동으로 실행됩니다.")
+            "켜면 Windows 로그인 시 KeyFlux 가 자동으로 실행됩니다. "
+            "작업 스케줄러에 등록되며(관리자 권한·UAC 창 없음), 배터리로 켜도 "
+            "실행됩니다. 등록이 사라지면 다음 실행 때 자동으로 복구합니다.")
         self.startup_chk.stateChanged.connect(self._toggle_startup)
 
         # 디버그 로그 (진단용)
@@ -2709,12 +3113,25 @@ class MainWindow(QMainWindow):
     # ── 시작 시 자동 실행 토글 ───────────────────────────────────
     def _toggle_startup(self, state):
         val = bool(state)
-        if set_startup(val):
+        ok = set_startup(val)
+        # 사용자의 의도는 성공/실패와 무관하게 저장해 둔다. 다음 실행 때
+        # ensure_startup() 이 이 값을 보고 실제 등록 상태를 맞춘다.
+        self.settings["startup"] = val and ok
+        save_settings(self.settings)
+        if ok:
+            state_now = startup_state()
+            how = ""
+            if val and state_now.get("kind") == "run":
+                # 작업 스케줄러가 막혀 레지스트리로 폴백한 경우 — 이때는
+                # 관리자 권한 없이 뜨므로 사용자에게 알려 준다.
+                how = " (제한 모드: 작업 스케줄러 등록 실패 → 레지스트리 등록)"
             self.status_label.setText(
-                "시작 시 자동 실행 " + ("등록됨" if val else "해제됨"))
+                "시작 시 자동 실행 " + ("등록됨" if val else "해제됨") + how)
         else:
-            # 실패 시 체크 상태를 실제 레지스트리 상태로 되돌린다
-            self.status_label.setText("시작 프로그램 설정에 실패했습니다.")
+            # 실패 시 체크 상태를 실제 등록 상태로 되돌리고, 원인을 보여준다.
+            why = startup_last_error()
+            self.status_label.setText(
+                "시작 프로그램 설정에 실패했습니다." + (f" — {why}" if why else ""))
             self.startup_chk.blockSignals(True)
             self.startup_chk.setChecked(is_startup_enabled())
             self.startup_chk.blockSignals(False)
