@@ -1195,6 +1195,7 @@ class TestImeCommitBeforeBackspace(unittest.TestCase):
         self._restore = main.ime_restore
         self._toggle = main.send_hangul_toggle
         self._send = main.send_text
+        self._fg = main.foreground_needs_scancode
         main.send_text = lambda *a, **k: (self.order.append("type"), True)[1]
         main.ime_restore = lambda saved: self.order.append("restore")
         main.send_hangul_toggle = lambda: (self.order.append("toggle"), True)[1]
@@ -1204,16 +1205,18 @@ class TestImeCommitBeforeBackspace(unittest.TestCase):
         main.ime_restore = self._restore
         main.send_hangul_toggle = self._toggle
         main.send_text = self._send
+        main.foreground_needs_scancode = self._fg
 
-    def _listener(self):
+    def _listener(self, console):
+        main.foreground_needs_scancode = lambda: console
         L = main.KeyboardListener()
         L.controller = _RecordingController(self.order)
         return L
 
-    def test_mode_switch_commits_before_backspaces(self):
+    def test_console_mode_switch_commits_before_backspaces(self):
         main.ime_force_alphanumeric = lambda: (self.order.append("force"),
                                                ("ime", 1))[1]
-        L = self._listener()
+        L = self._listener(console=True)
         L._inject_replacement("t", "OUT", "OUT", 2, composing=True)
         self.assertLess(self.order.index("force"), self.order.index("bs"),
                         "조합 확정이 백스페이스보다 먼저여야 한다")
@@ -1221,20 +1224,323 @@ class TestImeCommitBeforeBackspace(unittest.TestCase):
         self.assertNotIn("toggle", self.order,
                          "메시지 방식이 통했으면 한/영 키는 누르지 않는다")
 
-    def test_hangul_key_fallback_when_mode_switch_fails(self):
-        main.ime_force_alphanumeric = lambda: None  # Chromium 등: 메시지 무시
-        L = self._listener()
+    def test_console_hangul_key_fallback_when_mode_switch_fails(self):
+        main.ime_force_alphanumeric = lambda: None
+        L = self._listener(console=True)
         L._inject_replacement("t", "OUT", "OUT", 2, composing=True)
         self.assertEqual(self.order.count("toggle"), 2,
                          "확정용 한 번 + 원복용 한 번")
         self.assertLess(self.order.index("toggle"), self.order.index("bs"))
 
+    def test_gui_composing_always_uses_hangul_key(self):
+        # Chromium 은 변환모드 질의엔 '한글'이라 답하고 설정은 무시한다 →
+        # 메시지 방식 성공 여부와 무관하게 한/영 키로 확정해야 한다.
+        main.ime_force_alphanumeric = lambda: (self.order.append("force"),
+                                               ("ime", 1))[1]
+        L = self._listener(console=False)
+        L._inject_replacement("t", "OUT", "OUT", 2, composing=True)
+        self.assertEqual(self.order.count("toggle"), 2)
+        self.assertLess(self.order.index("toggle"), self.order.index("bs"))
+        self.assertNotIn("force", self.order,
+                         "GUI 유니코드 주입엔 영문 모드 강제가 필요 없다")
+
     def test_no_toggle_when_not_composing(self):
         main.ime_force_alphanumeric = lambda: None
-        L = self._listener()
-        L._inject_replacement("t", "OUT", "OUT", 2, composing=False)
-        self.assertNotIn("toggle", self.order,
-                         "조합이 없으면 한/영 키를 건드리지 않는다")
+        for console in (True, False):
+            self.order.clear()
+            L = self._listener(console=console)
+            L._inject_replacement("t", "OUT", "OUT", 2, composing=False)
+            self.assertNotIn("toggle", self.order,
+                             "조합이 없으면 한/영 키를 건드리지 않는다")
+
+
+class TestLongerKeywordWins(unittest.TestCase):
+    """긴 키워드를 칠 때 짧은 키워드가 먼저 발동하지 않아야 한다(v1.0.7)."""
+
+    RULES = [
+        {"type": "special", "trigger": ";;d", "output": "DATE", "enabled": True},
+        {"type": "special", "trigger": ";;dev", "output": "DEV", "enabled": True},
+        {"type": "special", "trigger": ";;dk", "output": "DK", "enabled": True},
+    ]
+
+    def test_korean_mode_long_keyword(self):
+        # 한글 모드로 ";;dev" → ';',';','ㅇ','ㄷ','ㅍ'. 예전엔 ;;ㅇ 에서 ;;d 발동.
+        h = ListenerHarness(self.RULES)
+        h.type_chars(";;ㅇ")
+        self.assertEqual(h.events, [], "긴 키워드로 이어질 수 있으면 보류")
+        h.type_chars("ㄷㅍ")
+        self.assertEqual([e[1] for e in h.events], [";;dev"])
+
+    def test_korean_mode_other_long_keyword(self):
+        h = ListenerHarness(self.RULES)
+        h.type_chars(";;ㅇㅏ")  # d,k
+        self.assertEqual([e[1] for e in h.events], [";;dk"])
+
+    def test_korean_mode_short_on_space(self):
+        h = ListenerHarness(self.RULES)
+        h.type_chars(";;ㅇ")
+        h.press_space()
+        self.assertEqual([(e[1], e[2]) for e in h.events], [(";;d", " ")])
+
+    def test_korean_mode_short_on_breaking_char(self):
+        h = ListenerHarness(self.RULES)
+        h.type_chars(";;ㅇ-")
+        self.assertEqual([(e[1], e[2]) for e in h.events], [(";;d", "-")])
+
+    def test_uppercase_long_keyword(self):
+        h = ListenerHarness(self.RULES)
+        h.type_chars(";;DEV")
+        self.assertEqual([e[1] for e in h.events], [";;dev"])
+
+    def test_longest_match_regardless_of_order(self):
+        # 짧은 "cl" 이 목록 위에 있어도 ";;cl" 을 치면 ";;cl" 이 이긴다.
+        h = ListenerHarness([
+            {"type": "special", "trigger": "cl", "output": "S", "enabled": True},
+            {"type": "special", "trigger": ";;cl", "output": "L", "enabled": True},
+        ])
+        h.type_chars(";;cl")
+        self.assertEqual([e[1] for e in h.events], [";;cl"])
+
+    def test_infix_rival_held(self):
+        # "bc" 가 "abcd" 의 중간에 들어 있어도 abcd 를 끝까지 칠 수 있어야 한다.
+        h = ListenerHarness([
+            {"type": "special", "trigger": "bc", "output": "S", "enabled": True},
+            {"type": "special", "trigger": "abcd", "output": "L", "enabled": True},
+        ])
+        h.type_chars("abc")
+        self.assertEqual(h.events, [])
+        h.type_chars("d")
+        self.assertEqual([e[1] for e in h.events], ["abcd"])
+        h.reset()
+        h.type_chars("xbc")  # abcd 로 갈 수 없는 문맥 → 즉시 발동
+        self.assertEqual([e[1] for e in h.events], ["bc"])
+
+    def test_longest_word_wins(self):
+        h = ListenerHarness([
+            {"type": "word", "trigger": "dev", "output": "S", "enabled": True},
+            {"type": "word", "trigger": "mydev", "output": "L", "enabled": True},
+        ])
+        h.type_chars("mydev")
+        h.press_space()
+        self.assertEqual([e[1] for e in h.events], ["mydev"])
+
+    def test_special_held_for_longer_word(self):
+        h = ListenerHarness([
+            {"type": "special", "trigger": ";;me", "output": "S", "enabled": True},
+            {"type": "word", "trigger": ";;mer", "output": "L", "enabled": True},
+        ])
+        h.type_chars(";;mer")
+        self.assertEqual(h.events, [])
+        h.press_space()
+        self.assertEqual([(e[1], e[2]) for e in h.events], [(";;mer", " ")])
+
+    def test_shift_does_not_break_input(self):
+        L = main.KeyboardListener()
+        fired = []
+        L._do_replace = lambda t, o, **k: fired.append(t)
+        L._do_replace_norm = lambda t, o, k, extra="": fired.append(t)
+        L.set_rules([{"type": "special", "trigger": "::d", "output": "X",
+                      "enabled": True}])
+        L._on_press(main.Key.shift)
+        L._on_press(_FakeCharKey(":"))
+        L._on_press(main.Key.shift)
+        L._on_press(_FakeCharKey(":"))
+        L._on_press(_FakeCharKey("d"))
+        self.assertEqual(fired, ["::d"])
+
+
+class TestPendingScreen(unittest.TestCase):
+    """보류 후 확정 시 화면 결과(앞뒤 띄어쓰기 포함)가 정확해야 한다."""
+
+    def _sim(self):
+        s = _ScreenSim({"type": "special", "trigger": ";;d",
+                        "output": "DATE", "enabled": True})
+        s.L.set_rules([
+            {"type": "special", "trigger": ";;d", "output": "DATE", "enabled": True},
+            {"type": "special", "trigger": ";;dev", "output": "DEV", "enabled": True},
+        ])
+        return s
+
+    def _raw(self, s, chars):
+        for ch in chars:
+            s.raw += ch
+            s.L._on_press(_FakeCharKey(ch))
+        return s
+
+    def test_breaking_char_keeps_spaces(self):
+        s = self._raw(self._sim(), "hi ;;dx")
+        self.assertEqual(s.screen_after(), "hi DATEx")
+        self.assertEqual(s.L.buffer, "hi DATEx", "버퍼도 화면과 같아야 한다")
+
+    def test_space_confirm_keeps_both_spaces(self):
+        s = self._sim()
+        s.type_jamo("안녕 ")
+        self._raw(s, ";;ㅇ")
+        s.finish("space")
+        self.assertEqual(s.screen_after(), "안녕 DATE ")
+        self.assertFalse(s.cap.get("composing"), "스페이스가 이미 조합을 확정")
+
+    def test_korean_breaking_char_marks_composing(self):
+        s = self._raw(self._sim(), "a ;;dㅎ")
+        self.assertTrue(s.cap.get("composing"))
+        self.assertEqual(s.screen_after(), "a DATEㅎ")
+
+    def test_long_keyword_in_korean_mode_keeps_space(self):
+        s = self._sim()
+        s.type_jamo("안녕 ")
+        self._raw(s, ";;ㅇㄷㅍ")
+        self.assertEqual(s.screen_after(), "안녕 DEV")
+
+
+class TestGroupHelpers(unittest.TestCase):
+    def test_rule_group_default_empty(self):
+        self.assertEqual(main.rule_group({"trigger": "a"}), "")
+        self.assertEqual(main.rule_group({"group": "  Git "}), "Git")
+
+    def test_all_groups_order(self):
+        rules = [{"group": "B"}, {"group": ""}, {"group": "A"}, {"group": "B"}]
+        self.assertEqual(main.all_groups(rules, ["Z", "A"]), ["Z", "A", "B"])
+
+    def test_effective_rules_excludes_disabled(self):
+        rules = [{"trigger": "a", "group": "G"}, {"trigger": "b"}]
+        self.assertEqual([r["trigger"] for r in main.effective_rules(rules, {"G"})], ["b"])
+        self.assertEqual([r["trigger"] for r in main.effective_rules(rules, {""})], ["a"])
+        self.assertEqual(len(main.effective_rules(rules, set())), 2)
+
+    def test_validate_group_name(self):
+        self.assertEqual(main.validate_group_name("Git"), "")
+        self.assertTrue(main.validate_group_name(""))
+        self.assertTrue(main.validate_group_name("미분류"))
+        self.assertTrue(main.validate_group_name("Git", ["Git"]))
+
+
+class TestMainWindowGroups(unittest.TestCase):
+    """메인 창 그룹 기능(필터·켜기/끄기·이름 변경·삭제·순서) — 임시 파일 사용."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        d = Path(self.tmp.name)
+        self._saved = {k: getattr(main, k) for k in (
+            "DATA_FILE", "SETTINGS_FILE", "VARIABLES_FILE", "ensure_startup")}
+        main.DATA_FILE = d / "rules.json"
+        main.SETTINGS_FILE = d / "settings.json"
+        main.VARIABLES_FILE = d / "vars.json"
+        main.ensure_startup = lambda settings: False
+        self._start = main.KeyboardListener.start
+        main.KeyboardListener.start = lambda self: None
+        main.save_rules([
+            {"type": "special", "trigger": ";;fet", "output": "git fetch", "enabled": True, "group": "Git"},
+            {"type": "special", "trigger": ";;pw", "output": "git push", "enabled": True, "group": "Git"},
+            {"type": "special", "trigger": ";;gg", "output": "me@x", "enabled": True, "group": "메일"},
+            {"type": "special", "trigger": ";;d", "output": "{date}", "enabled": True},
+        ])
+        self.w = main.MainWindow()
+
+    def tearDown(self):
+        self.w.tray.hide()
+        self.w.deleteLater()
+        for k, v in self._saved.items():
+            setattr(main, k, v)
+        main.KeyboardListener.start = self._start
+        self.tmp.cleanup()
+
+    def _active(self):
+        return sorted(r["trigger"] for r in self.w.listener.rules)
+
+    def test_group_panel_lists_groups(self):
+        self.assertEqual(self.w._group_rows, [None, "Git", "메일", ""])
+        self.assertEqual(self.w.table.rowCount(), 4)
+
+    def test_filter_by_group(self):
+        self.w.group_list.setCurrentRow(1)  # Git
+        self.assertEqual(self.w.table.rowCount(), 2)
+        self.assertEqual({self.w.table.item(r, 3).text() for r in range(2)},
+                         {";;fet", ";;pw"})
+
+    def test_disable_group_stops_its_keywords(self):
+        item = self.w.group_list.item(1)  # Git
+        item.setCheckState(main.Qt.CheckState.Unchecked)
+        self.assertEqual(self._active(), [";;d", ";;gg"])
+        self.assertIn("Git", main.load_settings()["disabled_groups"])
+        # 다시 켜면 복구
+        self.app.processEvents()
+        self.w.group_list.item(1).setCheckState(main.Qt.CheckState.Checked)
+        self.assertEqual(len(self._active()), 4)
+
+    def test_disabled_group_survives_restart(self):
+        self.w.group_list.item(2).setCheckState(main.Qt.CheckState.Unchecked)
+        self.w.tray.hide()
+        w2 = main.MainWindow()
+        try:
+            self.assertNotIn(";;gg", [r["trigger"] for r in w2.listener.rules])
+        finally:
+            w2.tray.hide()
+            w2.deleteLater()
+
+    def test_rename_group(self):
+        self.w.group_list.setCurrentRow(1)
+        self.w._ask_group_name = lambda *a, **k: "깃"
+        self.w._rename_group()
+        groups = {r["trigger"]: main.rule_group(r) for r in main.load_rules()}
+        self.assertEqual(groups[";;fet"], "깃")
+        self.assertIn("깃", self.w._group_rows)
+        self.assertNotIn("Git", self.w._group_rows)
+
+    def test_delete_group_keeps_keywords(self):
+        self.w.group_list.setCurrentRow(1)
+        orig = main.QMessageBox.question
+        main.QMessageBox.question = staticmethod(
+            lambda *a, **k: main.QMessageBox.StandardButton.Yes)
+        try:
+            self.w._delete_group()
+        finally:
+            main.QMessageBox.question = orig
+        rules = main.load_rules()
+        self.assertEqual(len(rules), 4, "키워드는 지우지 않는다")
+        self.assertEqual(main.rule_group(rules[0]), "")
+        self.assertNotIn("Git", self.w._group_rows)
+
+    def test_add_empty_group_persists(self):
+        self.w._ask_group_name = lambda *a, **k: "빈그룹"
+        self.w._add_group()
+        self.assertIn("빈그룹", self.w._group_rows)
+        self.assertIn("빈그룹", main.load_settings()["groups"])
+        self.assertEqual(self.w.table.rowCount(), 0, "새 그룹이 선택돼 비어 보임")
+
+    def test_move_rule_to_group(self):
+        self.w._move_rule_to_group(3, "메일")
+        self.assertEqual(main.rule_group(main.load_rules()[3]), "메일")
+
+    def test_reorder_within_filter_keeps_others(self):
+        self.w.group_list.setCurrentRow(1)  # Git: idx 0,1
+        # 화면 행 순서를 뒤집은 것처럼 UserRole 인덱스를 바꿔 놓는다
+        t = self.w.table
+        a, b = t.item(0, 1), t.item(1, 1)
+        ia, ib = a.data(main.Qt.ItemDataRole.UserRole), b.data(main.Qt.ItemDataRole.UserRole)
+        a.setData(main.Qt.ItemDataRole.UserRole, ib)
+        b.setData(main.Qt.ItemDataRole.UserRole, ia)
+        self.w._on_table_reordered()
+        self.assertEqual([r["trigger"] for r in self.w.rules],
+                         [";;pw", ";;fet", ";;gg", ";;d"])
+
+    def test_rule_dialog_group_roundtrip(self):
+        dlg = main.RuleDialog(None, {"type": "special", "trigger": "x",
+                                     "output": "y", "group": "Git"},
+                              groups=["Git", "메일"])
+        self.assertEqual(dlg.get_rule()["group"], "Git")
+        dlg.group_combo.setCurrentText("(미분류)")
+        self.assertEqual(dlg.get_rule()["group"], "")
+        dlg.group_combo.setCurrentText("새그룹")
+        self.assertEqual(dlg.get_rule()["group"], "새그룹")
+
+    def test_new_rule_defaults_to_filtered_group(self):
+        dlg = main.RuleDialog(None, groups=["Git"], default_group="Git")
+        self.assertEqual(dlg.get_group(), "Git")
 
 
 class _RecordingController:

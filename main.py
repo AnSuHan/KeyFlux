@@ -13,7 +13,8 @@ from PyQt6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem, QLabel, QLineEdit,
     QDialog, QFormLayout, QComboBox, QMessageBox, QSystemTrayIcon,
     QMenu, QHeaderView, QFrame, QCheckBox, QFileDialog, QGroupBox,
-    QDialogButtonBox, QPlainTextEdit, QTextBrowser
+    QDialogButtonBox, QPlainTextEdit, QTextBrowser, QListWidget,
+    QListWidgetItem, QInputDialog
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QIcon, QColor, QFont, QPixmap, QPainter, QKeySequence, QShortcut
@@ -22,7 +23,7 @@ from pynput.keyboard import Key, Controller
 import ctypes
 
 # 앱 버전 (SemVer). 릴리스 태그 v<버전> 과 일치시킨다.
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 
 
 # ── 유니코드 직접 주입 (Windows SendInput) ───────────────────────
@@ -426,6 +427,51 @@ def save_rules(rules):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(rules, f, ensure_ascii=False, indent=2)
 
+# ── 키워드 그룹 ──────────────────────────────────────────────────
+# 규칙마다 선택적으로 "group" 이름을 가진다(없거나 "" 면 미분류).
+# 그룹 목록의 순서·빈 그룹·꺼진 그룹은 설정 파일(groups / disabled_groups)에
+# 보관하고, 그룹 이름 자체는 규칙과 함께 rules.json 에 저장돼 내보내기/
+# 불러오기 때 같이 따라간다.
+UNGROUPED_LABEL = "미분류"
+_RESERVED_GROUP_NAMES = {UNGROUPED_LABEL, "전체", "(미분류)"}
+
+
+def rule_group(rule) -> str:
+    """규칙의 그룹 이름("" = 미분류)."""
+    return str(rule.get("group") or "").strip()
+
+
+def all_groups(rules, known=None) -> list:
+    """표시할 그룹 이름 목록(미분류 제외). 설정에 저장된 순서(known)를
+    먼저, 그 다음 규칙에만 등장하는 그룹을 등장 순서대로 붙인다."""
+    out = []
+    for g in list(known or []) + [rule_group(r) for r in rules]:
+        g = str(g or "").strip()
+        if g and g not in out:
+            out.append(g)
+    return out
+
+
+def effective_rules(rules, disabled_groups=None) -> list:
+    """꺼진 그룹에 속한 규칙을 뺀 목록(리스너에 넘길 규칙)."""
+    disabled = set(disabled_groups or [])
+    if not disabled:
+        return list(rules)
+    return [r for r in rules if rule_group(r) not in disabled]
+
+
+def validate_group_name(name: str, existing=()) -> str:
+    """그룹명이 유효하면 "", 아니면 사용자에게 보여줄 오류 사유."""
+    name = (name or "").strip()
+    if not name:
+        return "그룹 이름을 입력하세요."
+    if name in _RESERVED_GROUP_NAMES:
+        return f"'{name}' 은(는) 그룹 이름으로 쓸 수 없습니다."
+    if name in existing:
+        return f"'{name}' 그룹이 이미 있습니다."
+    return ""
+
+
 def prioritize_rules(rules):
     """트리거가 ';;' 로 시작하는 규칙을 항상 목록 맨 위(1순위)로 끌어올린
     새 리스트를 반환한다. 같은 그룹 내 상대 순서는 유지(안정 정렬)."""
@@ -455,6 +501,9 @@ DEFAULT_SETTINGS = {
     # 와 별개로 의도를 남겨 두고, 시작할 때마다 ensure_startup() 이 둘을 맞춘다
     # (작업이 지워졌거나 exe 를 옮겨 경로가 낡은 경우 조용히 재등록).
     "startup": False,
+    # 키워드 그룹 표시 순서(빈 그룹 포함)와 꺼 둔 그룹 목록("" = 미분류).
+    "groups": [],
+    "disabled_groups": [],
 }
 
 def load_settings():
@@ -1213,6 +1262,8 @@ class KeyboardListener(QObject):
         # → 단축어 뒤에 바로 친 띄어쓰기/글자가 사라지지 않는다.
         self._blocked_keys = []
         self._replay_timer = None
+        # 보류 확정 시 _do_replace 에 넘기는 "조합 중" 판단값(1회용).
+        self._composing_hint = None
 
         # ── 빠른 필터링용 인덱스 (set_rules에서 갱신) ──────────────
         # 매 키 입력마다 모든 규칙을 endswith()로 검사하지 않고,
@@ -1222,6 +1273,11 @@ class KeyboardListener(QObject):
         self._special_last_chars = set()
         self._word_last_chars = set()
         self._has_regex = False
+        # 매칭 후보를 "긴 트리거 먼저" 정렬한 목록(set_rules 에서 갱신).
+        # 규칙 목록 순서와 무관하게 더 긴(구체적인) 트리거가 항상 이긴다
+        # → 예: "cl" 이 ";;cl" 보다 위에 있어도 ";;cl" 을 치면 ";;cl" 발동.
+        self._special_sorted = []
+        self._word_sorted = []
         # 한/영·대소문자 무관 매칭 옵션 (기본 활성화). True면 입력/트리거를
         # 물리 키 시퀀스로 정규화해 비교한다(normalize_keyseq 참조).
         self.normalize_mode = True
@@ -1236,7 +1292,7 @@ class KeyboardListener(QObject):
         # 짧은 트리거가 더 긴 트리거의 접두사이면 즉시 치환하지 않고
         # "보류(pending)"했다가, 다음 입력이 더 긴 트리거로 갈 수 없게
         # 되는 순간 그제서야 짧은 트리거를 확정 치환한다.
-        self._pending = None        # (trigger, output, via) 또는 None
+        self._pending = None        # (trigger, output, via, k) 또는 None
         self._pending_len = 0       # 보류 시점의 buffer 길이
         self._pending_trig_raw_len = 0  # 보류된 트리거가 차지하는 원본(raw) 글자 수
 
@@ -1284,6 +1340,17 @@ class KeyboardListener(QObject):
                 if r["type"] in ("special", "word") and r["trigger"]:
                     self._norm_triggers[r["trigger"]] = normalize_keyseq(r["trigger"])
 
+        def _keylen(r):
+            # 물리 키 수 기준 길이(한글 "안녕"=6키, ";;dev"=5키). 안정 정렬이라
+            # 길이가 같으면 목록 순서(사용자 지정 우선순위)를 유지한다.
+            return -len(normalize_keyseq(r["trigger"]))
+        self._special_sorted = sorted(
+            (r for r in self.rules if r["type"] == "special" and r["trigger"]),
+            key=_keylen)
+        self._word_sorted = sorted(
+            (r for r in self.rules if r["type"] == "word" and r["trigger"]),
+            key=_keylen)
+
     def _collect_last_chars(self, rule_type):
         """트리거의 마지막 글자를 원본(분리형)·조합형 양쪽 다 수집한다.
         예: 트리거가 한글 자모 시퀀스("ㅎㄴㅇ")든 완성형("한녕")이든
@@ -1323,34 +1390,76 @@ class KeyboardListener(QObject):
                 return None
         return None
 
+    def _rival_spaces(self, since_len):
+        """라이벌 도달 가능성을 비교할 '공간' 목록.
+        각 항목: (현재 입력 문자열, 트리거 변환 함수, since_len 이후 입력 길이).
+        - 한/영 무관 모드: 물리 키 시퀀스 공간 하나로 비교(한글 모드로 영문
+          트리거를 치는 경우까지 포함 → 예전엔 이 경우 보류가 안 돼서 한글
+          모드로 ";;dev" 를 치면 ";;d" 가 먼저 발동했다).
+        - 끈 상태: 원본(자모) 공간과 조합형(화면) 공간 둘 다."""
+        since_len = max(0, min(since_len, len(self.buffer)))
+        tail = self.buffer[since_len:]
+        if self.normalize_mode:
+            return [(normalize_keyseq(self.buffer), normalize_keyseq,
+                     len(normalize_keyseq(tail)))]
+        comp_extra = max(0, len(self.composed)
+                         - len(compose_hangul(self.buffer[:since_len])))
+        ident = lambda s: s  # noqa: E731
+        return [(self.buffer, ident, len(tail)),
+                (self.composed, ident, comp_extra)]
+
     def _holdable_rivals(self, trig):
-        """trig 를 진접두사로 갖는 더 긴 enabled special 트리거 목록.
-        (예: trig="::d" -> ["::dev"]). 비어 있지 않으면 trig 는 보류 대상."""
+        """trig 보다 긴 트리거 중, trig 를 '안에 품을 수 있는' 라이벌 목록.
+        반환: [(라이벌 트리거, word 여부)]. special·word 모두 대상.
+        접두사(::d → ::dev)뿐 아니라 중간/끝에 품는 경우(bc → abcd)도 포함.
+        실제로 지금 도달 가능한지는 _rival_reachable 이 판단한다."""
+        with self._lock:
+            rules = self.rules[:]
+            norm_on = self.normalize_mode
+        form = normalize_keyseq if norm_on else (lambda s: s)
+        tf = form(trig)
         rivals = []
-        for r in self.rules:
-            if r["type"] != "special":
+        for r in rules:
+            if r["type"] not in ("special", "word"):
                 continue
             t2 = r["trigger"]
-            if t2 != trig and len(t2) > len(trig) and t2.startswith(trig):
-                rivals.append(t2)
+            if not t2 or t2 == trig:
+                continue
+            f2 = form(t2)
+            if len(f2) > len(tf) and tf in f2:
+                rivals.append((t2, r["type"] == "word"))
         return rivals
 
-    def _still_reaching(self, trig):
-        """보류 중인 trig 의 더 긴 라이벌 트리거에 아직 도달 가능한지.
-        현재 입력(조합형/분리형)이 라이벌의 '진부분 접두사'로 끝나면 True."""
-        for t2 in self._holdable_rivals(trig):
-            # trig 보다 '더 긴' 접두사(= 라이벌 쪽으로 한 글자 이상 진행한 상태)
-            # 가 현재 입력 끝과 일치하면 아직 도달 가능.
-            for j in range(len(t2) - 1, len(trig), -1):
-                p = t2[:j]
-                if self.composed.endswith(p) or self.buffer.endswith(p):
-                    return True
+    def _rival_reachable(self, trig, rivals, since_len):
+        """현재 입력에서 계속 치면 더 긴 라이벌 트리거가 완성될 수 있는지.
+        since_len: trig 가 완성된 시점의 buffer 길이(그 뒤 입력분 포함 판단).
+        라이벌의 접두사 p 가 입력 끝과 일치하고, 그 p 가 (trig + 이후 입력)
+        전체를 덮을 만큼 길면 아직 도달 가능하다.
+        special 라이벌은 '진접두사'까지만(완성되면 그 자체가 매칭돼 발동),
+        word 라이벌은 끝까지(스페이스/엔터를 쳐야 발동하므로)."""
+        if not rivals:
+            return False
+        for inp, form, extra in self._rival_spaces(since_len):
+            need = len(form(trig)) + extra
+            for t2, is_word in rivals:
+                f2 = form(t2)
+                max_j = len(f2) if is_word else len(f2) - 1
+                for j in range(max_j, max(need, 1) - 1, -1):
+                    if inp.endswith(f2[:j]):
+                        return True
         return False
+
+    def _still_reaching(self, trig):
+        """보류 중인 trig 의 더 긴 라이벌 트리거에 아직 도달 가능한지."""
+        return self._rival_reachable(
+            trig, self._holdable_rivals(trig), self._pending_len)
 
     def _fire_special(self, trig, output, via, k=None, extra=""):
         """매칭된 special 트리거를 실제 치환으로 실행."""
         if via == "norm":
             self._do_replace_norm(trig, output, k, extra=extra)
+        elif k:
+            self._do_replace(trig, output, extra=extra, via=via, consumed_raw=k)
         else:
             self._do_replace(trig, output, extra=extra, via=via)
 
@@ -1398,9 +1507,15 @@ class KeyboardListener(QObject):
             elif key == Key.backspace:
                 self.buffer = self.buffer[:-1]
                 self.composed = compose_hangul(self.buffer)
-                # 보류 중이던 짧은 트리거가 더 이상 버퍼 끝에 없으면 보류 해제
-                if self._pending and not self.buffer.endswith(self._pending[0]):
+                # 보류 중이던 짧은 트리거 자체를 지우기 시작했으면 보류 해제
+                if self._pending and len(self.buffer) < self._pending_len:
                     self._pending = None
+            elif self._is_passive_key(key):
+                # Shift·CapsLock·한/영 같은 "글자를 만들지 않는" 키는 입력
+                # 흐름을 끊지 않는다. 예전엔 이 키들도 버퍼를 비워서
+                # ① 대문자/기호를 치려고 Shift 를 누르면 앞 문맥이 사라지고
+                # ② ";;" 까지 친 뒤 한/영을 바꾸면 트리거가 아예 안 먹었다.
+                return
             else:
                 self.buffer = ""
                 self.composed = ""
@@ -1417,13 +1532,29 @@ class KeyboardListener(QObject):
         dbg(f"key {ch!r} buf={self.buffer[-24:]!r} comp={self.composed[-24:]!r}")
         self._check_immediate()
 
+    # 글자를 만들지 않아 입력 흐름(버퍼)을 끊지 않는 키의 가상키 코드.
+    # 0x10~0x12/0xA0~0xA5: Shift·Ctrl·Alt(좌우) — 단독으로 눌렀다 뗀 경우,
+    # 0x14: CapsLock, 0x15: 한/영, 0x19: 한자, 0x5B/0x5C: Win 은 제외(단축키용).
+    # Ctrl/Alt 는 Ctrl+C 처럼 '조합'으로 쓰이지만, 조합된 글자 키는 char 가
+    # 제어문자(\x03 등)로 들어와 별도로 걸러지므로 여기선 Shift 류만 허용한다.
+    _PASSIVE_VKS = {0x10, 0xA0, 0xA1, 0x14, 0x15, 0x19}
+
+    @classmethod
+    def _is_passive_key(cls, key) -> bool:
+        if key in (Key.shift, Key.shift_l, Key.shift_r, Key.caps_lock):
+            return True
+        vk = getattr(key, "vk", None)
+        if vk is None:
+            vk = getattr(getattr(key, "value", None), "vk", None)
+        return vk in cls._PASSIVE_VKS
+
     def _check_immediate(self):
         if not self.buffer:
             self._pending = None
             return
         with self._lock:
             last_chars = self._special_last_chars
-            rules = self.rules[:]
+            rules = self._special_sorted[:]
             norm_on = self.normalize_mode
             norm_trigs = self._norm_triggers if norm_on else {}
 
@@ -1439,10 +1570,8 @@ class KeyboardListener(QObject):
             return
 
         # 2) 버퍼 끝에 완전히 일치하는 special 트리거를 찾는다
-        #    (조합형 → 분리형 → 정규화 순)
+        #    (긴 트리거 먼저 / 각 트리거는 조합형 → 분리형 → 정규화 순)
         for rule in rules:
-            if rule["type"] != "special":
-                continue
             trig = rule["trigger"]
             matched_via = None
             matched_k = None
@@ -1459,12 +1588,16 @@ class KeyboardListener(QObject):
 
             k = self._trig_raw_len(trig, matched_via, matched_k)
 
-            # 더 긴 트리거(예: "::dev")가 있으면 즉시 치환하지 않고 보류.
-            # (정규화 매칭은 보류 대상에서 제외 — 교차모드+접두사 겹침은 드묾)
-            if matched_via != "norm" and self._holdable_rivals(trig):
-                self._pending = (trig, rule["output"], matched_via)
+            # 더 긴 트리거(예: "::dev")로 아직 이어질 수 있으면 즉시 치환하지
+            # 않고 보류. 정규화(한/영 무관) 매칭도 똑같이 보류한다 — 예전엔
+            # 여기서 빠져 있어 한글 모드로 ";;dev" 를 치면 ";;ㅇ" 에서 ";;d" 가
+            # 먼저 발동해 긴 키워드를 영영 쓸 수 없었다.
+            if self._rival_reachable(trig, self._holdable_rivals(trig),
+                                     len(self.buffer)):
+                self._pending = (trig, rule["output"], matched_via, k)
                 self._pending_len = len(self.buffer)
                 self._pending_trig_raw_len = k
+                dbg(f"PENDING trig={trig!r} via={matched_via} k={k}")
                 return
 
             self._pending = None
@@ -1497,19 +1630,51 @@ class KeyboardListener(QObject):
             return
         self._confirm_pending_special()
 
-    def _check_and_replace(self, append=""):
-        # 보류된 짧은 트리거가 있고, 더 긴 라이벌에 도달할 수 없으면
-        # (스페이스/엔터로 단어가 끝났으므로 대개 도달 불가) 지금 확정한다.
-        if self._pending and not self._still_reaching(self._pending[0]):
-            self._confirm_pending_special(append=append)
-            return
+    def _match_word(self, word_rules, norm_on, norm_trigs):
+        """버퍼 끝과 일치하는 word 규칙을 (긴 트리거 먼저) 찾는다.
+        반환: (trigger, output, via, k) 또는 None."""
+        buf = self.buffer
+        comp = self.composed
+        for rule in word_rules:
+            trig = rule["trigger"]
+            if comp.endswith(trig):
+                return trig, rule["output"], "composed", None
+            if buf.endswith(trig):
+                return trig, rule["output"], "raw", None
+            if norm_on:
+                k = self._find_norm_match(norm_trigs.get(trig))
+                if k:
+                    return trig, rule["output"], "norm", k
+        return None
 
+    def _fire_word(self, match, append):
+        trig, output, via, k = match
+        if via == "norm":
+            self._do_replace_norm(trig, output, k, extra=append)
+        else:
+            self._do_replace(trig, output, extra=append, via=via)
+
+    def _check_and_replace(self, append=""):
         with self._lock:
             rules = self.rules[:]
+            word_rules = self._word_sorted[:]
             word_last_chars = self._word_last_chars
             has_regex = self._has_regex
             norm_on = self.normalize_mode
             norm_trigs = self._norm_triggers if norm_on else {}
+
+        # 보류된 짧은 special 트리거가 있으면 스페이스/엔터에서 반드시 결론을
+        # 낸다(special 은 공백을 넘어 이어지지 않으므로). 단 그 트리거를 품은
+        # 더 긴 word 트리거가 지금 완성됐다면 그쪽이 이긴다.
+        if self._pending:
+            p_trig = self._pending[0]
+            wm = self._match_word(word_rules, norm_on, norm_trigs)
+            if wm and any(t2 == wm[0] for t2, _ in self._holdable_rivals(p_trig)):
+                self._pending = None
+                self._fire_word(wm, append)
+                return
+            self._confirm_pending_special(append=append)
+            return
 
         buf = self.buffer
         comp = self.composed
@@ -1521,21 +1686,10 @@ class KeyboardListener(QObject):
         #    (분리형/조합형/정규화 어느 쪽이든) 일치할 때만 정밀 검사
         if (last_raw in word_last_chars or last_comp in word_last_chars
                 or last_norm in word_last_chars):
-            for rule in rules:
-                if rule["type"] != "word":
-                    continue
-                trig = rule["trigger"]
-                if comp.endswith(trig):
-                    self._do_replace(trig, rule["output"], extra=append, via="composed")
-                    return
-                if buf.endswith(trig):
-                    self._do_replace(trig, rule["output"], extra=append, via="raw")
-                    return
-                if norm_on:
-                    k = self._find_norm_match(norm_trigs.get(trig))
-                    if k:
-                        self._do_replace_norm(trig, rule["output"], k, extra=append)
-                        return
+            wm = self._match_word(word_rules, norm_on, norm_trigs)
+            if wm:
+                self._fire_word(wm, append)
+                return
 
         # 2) regex 트리거가 하나라도 등록된 경우에만 검사 (조합형 기준)
         if has_regex:
@@ -1567,14 +1721,24 @@ class KeyboardListener(QObject):
         파라미터 규칙이면 캡처로 진입(엔터로 확정됐으면 즉시 종료),
         아니면 기존대로 즉시 치환한다. append 는 확정 계기가 된
         스페이스/엔터(''·' '·'\\n')."""
-        p_trig, p_out, p_via = self._pending
+        p_trig, p_out, p_via = self._pending[:3]
         k = self._pending_trig_raw_len
         self._pending = None
 
         if not output_is_parameterized(p_out):
             # 비파라미터: 보류 이후 입력분 + 스페이스/엔터를 그대로 다시 찍는다.
-            extra = self.buffer[self._pending_len:] + append
-            self._fire_special(p_trig, p_out, p_via, extra=extra)
+            # 보류 이후 입력분(tail)은 화면에 이미 찍혀 있으므로, 버퍼를 트리거
+            # 끝까지로 잘라 '트리거만' 정확히 계산하게 하고, tail 은 화면 형태로
+            # extra 에 실어 지운 뒤 다시 찍는다. (예전엔 tail 이 버퍼 끝에 붙은
+            # 채로 계산해 트리거 길이 판정이 어긋나고 버퍼가 화면과 달라졌다.)
+            tail_raw = self.buffer[self._pending_len:]
+            # 스페이스/엔터는 조합을 확정시키므로 그땐 조합 중이 아니다.
+            composing = (not append) and is_jamo((tail_raw or self.buffer)[-1:])
+            self.buffer = self.buffer[:self._pending_len]
+            self.composed = compose_hangul(self.buffer)
+            extra = compose_hangul(tail_raw) + append
+            self._composing_hint = composing
+            self._fire_special(p_trig, p_out, p_via, k=k, extra=extra)
             return
 
         if append == "\n":
@@ -1690,6 +1854,7 @@ class KeyboardListener(QObject):
         # 재귀/중첩 호출 방어: 이전 치환의 입력 주입이 아직 진행 중이면 무시
         if self._replacing:
             dbg(f"REPLACE skipped (busy) trig={trigger!r}")
+            self._composing_hint = None
             return
         self._replacing = True
 
@@ -1717,6 +1882,14 @@ class KeyboardListener(QObject):
         #  bs 3개가 ";;" 와 공백을 지워 "안녕.결과" 가 됨)
         # 그래서 주입 스레드가 백스페이스 전에 조합을 확정시키도록 알려 준다.
         composing = is_jamo(self.buffer[-1:]) if consumed_raw else False
+        # extra 가 스페이스/엔터면 그 키가 이미 조합을 확정시켰다.
+        if extra and extra[-1] in " \n":
+            composing = False
+        # 보류 확정처럼 버퍼를 잘라서 넘긴 경우엔 호출자가 실제 화면 끝 기준으로
+        # 판단한 값을 쓴다.
+        hint, self._composing_hint = self._composing_hint, None
+        if hint is not None:
+            composing = hint
 
         # ── 화면(조합형) 기준으로 실제 지워야 할 글자 수를 정확히 계산 ──────
         # 트리거를 치기 '전' 화면(before)과 '후' 화면(after)을 비교한다.
@@ -1792,11 +1965,24 @@ class KeyboardListener(QObject):
             #        방식이라 화면 깜빡임이 없고, 주입 중 자모 간섭도 막아 준다.
             #    (b) Chromium 계열처럼 그 메시지를 무시하는 앱에서는 진짜
             #        한/영 키를 눌러 확정시킨다(끝나고 다시 눌러 원복).
-            saved_ime = ime_force_alphanumeric()
-            if composing and not saved_ime:
+            #
+            #    - 콘솔(스캔코드 주입): 출력이 한글로 바뀌지 않게 어차피 영문
+            #      모드가 필요하므로 (a) 를 쓰고, 안 먹으면 (b).
+            #    - 그 외 GUI(유니코드 주입): 영문 모드가 필요 없으므로 조합 중일
+            #      때만 (b) 진짜 한/영 키로 확정한다. 예전엔 여기서도 (a) 를 먼저
+            #      쓰고 '성공'하면 (b) 를 건너뛰었는데, Chromium(VSCode 등)은
+            #      변환모드 질의엔 '한글'이라 답하면서 설정은 무시해서 조합이
+            #      확정되지 않은 채 백스페이스가 나가 앞 띄어쓰기가 지워질 수
+            #      있었다. 한/영 키는 어떤 앱이든 IME 가 직접 처리하므로 확실하다.
+            console = foreground_needs_scancode()
+            if console:
+                saved_ime = ime_force_alphanumeric()
+                if composing and not saved_ime:
+                    toggled = send_hangul_toggle()
+            elif composing:
                 toggled = send_hangul_toggle()
             if saved_ime or toggled:
-                time.sleep(0.01)  # 확정이 반영될 짧은 시간
+                time.sleep(0.02)  # 확정이 반영될 짧은 시간
             dbg(f"inject ime_commit forced={bool(saved_ime)} toggled={toggled}")
 
             # 1) 화면에 보이는 글자 수(backspace_count)만큼 백스페이스를
@@ -1831,7 +2017,7 @@ class KeyboardListener(QObject):
             #
             #    어느 쪽이든 줄바꿈/탭은 '진짜 키'로, 못 치는 글자(한글 등)는
             #    유니코드로 처리된다. 클립보드는 건드리지 않는다.
-            if foreground_needs_scancode():
+            if console:
                 # IME 는 위(0단계)에서 이미 영문으로 돌려 두었다(조합 확정 겸용).
                 dbg(f"inject via=scancode ime_forced={bool(saved_ime)}")
                 ok = send_text(to_type, case_guarantee=self.case_guarantee)
@@ -2098,10 +2284,11 @@ def show_placeholder_help(parent=None, variables: dict = None):
 
 # ── 규칙 추가/편집 다이얼로그 ────────────────────────────────────
 class RuleDialog(QDialog):
-    def __init__(self, parent=None, rule=None, variables=None):
+    def __init__(self, parent=None, rule=None, variables=None,
+                 groups=None, default_group=""):
         super().__init__(parent)
         self.setWindowTitle("규칙 편집" if rule else "규칙 추가")
-        self.setFixedSize(440, 470)
+        self.setFixedSize(440, 510)
         self.setStyleSheet(parent.styleSheet() if parent else "")
         # 미리보기에서 {이름} 을 실제 값으로 보여주기 위한 현재 변수 사전.
         self._variables = dict(variables or {})
@@ -2126,7 +2313,19 @@ class RuleDialog(QDialog):
         # 여러 줄 편집기의 기본 Tab(탭 문자 삽입)을 유지한다.
         self.output_edit.setTabChangesFocus(True)
 
+        # 그룹: 기존 그룹에서 고르거나 새 이름을 직접 입력(자동으로 그룹 생성).
+        self.group_combo = QComboBox()
+        self.group_combo.setEditable(True)
+        self.group_combo.addItem("(미분류)")
+        for g in (groups or []):
+            self.group_combo.addItem(g)
+        self.group_combo.setToolTip(
+            "키워드를 묶을 그룹. 목록에서 고르거나 새 이름을 입력하면 그룹이 "
+            "만들어집니다. 그룹 단위로 켜고 끌 수 있습니다.")
+        self._set_group_text(default_group)
+
         layout.addRow("타입",   self.type_combo)
+        layout.addRow("그룹",   self.group_combo)
         layout.addRow("트리거", self.trigger_edit)
         layout.addRow("출력",   self.output_edit)
 
@@ -2200,7 +2399,16 @@ class RuleDialog(QDialog):
             self.type_combo.setCurrentIndex(type_map.get(rule["type"], 0))
             self.trigger_edit.setText(rule["trigger"])
             self.output_edit.setPlainText(rule["output"])
+            self._set_group_text(rule_group(rule))
             self._update_preview()
+
+    def _set_group_text(self, name: str):
+        name = (name or "").strip()
+        self.group_combo.setCurrentText(name if name else "(미분류)")
+
+    def get_group(self) -> str:
+        g = self.group_combo.currentText().strip()
+        return "" if g in ("", "(미분류)", UNGROUPED_LABEL) else g
 
     # 미리보기에서 위치 인자({1},{2}…)를 채울 샘플 값.
     _SAMPLE_ARGS = ["인자1", "인자2", "인자3"]
@@ -2249,6 +2457,7 @@ class RuleDialog(QDialog):
             # 않는다(앞뒤 줄바꿈/들여쓰기까지 저장·주입 그대로 보존).
             "output":  self.output_edit.toPlainText(),
             "enabled": True,
+            "group":   self.get_group(),
         }
 
 
@@ -2389,11 +2598,17 @@ class MainWindow(QMainWindow):
         # 관리자 권한 실행 여부를 제목에 표시(관리자 앱 대응 동작 확인용)
         self.setWindowTitle(
             f"KeyFlux v{APP_VERSION}" + (" (관리자)" if is_elevated() else ""))
-        self.setMinimumSize(700, 540)
+        self.setMinimumSize(860, 560)
         self.setWindowIcon(make_app_icon())  # 창/작업표시줄 아이콘
         self.rules = load_rules()
         self.settings = load_settings()
         self.variables = load_variables()
+        # 키워드 그룹 상태: 표시 순서(빈 그룹 포함) / 꺼진 그룹 / 현재 필터.
+        # group_filter: None = 전체 보기, "" = 미분류, 그 외 = 그룹 이름.
+        self.group_order = all_groups(self.rules, self.settings.get("groups"))
+        self.disabled_groups = set(self.settings.get("disabled_groups") or [])
+        self.group_filter = None
+        self._group_rows = [None]
         set_debug(self.settings.get("debug_log", False))
         # "자동 실행 켬"으로 저장돼 있는데 실제 등록이 사라졌거나 낡은 경로를
         # 가리키면(작업 삭제·exe 이동 등) 여기서 조용히 다시 등록한다.
@@ -2608,14 +2823,17 @@ class MainWindow(QMainWindow):
 
         # 테이블
         self.table = RulesTable()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["활성", "타입", "트리거", "출력"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["활성", "타입", "그룹", "트리거", "출력"])
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(0, 48)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(1, 90)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(1, 80)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(2, 90)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -2633,8 +2851,16 @@ class MainWindow(QMainWindow):
 
         # 더블클릭 시 편집 창 열기
         self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
+        # 우클릭 메뉴: 편집/삭제/그룹 이동
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_rule_menu)
 
-        root.addWidget(self.table)
+        # 왼쪽: 그룹 패널(필터 + 그룹별 켜기/끄기), 오른쪽: 규칙 테이블
+        body = QHBoxLayout()
+        body.setSpacing(10)
+        body.addWidget(self._build_group_panel())
+        body.addWidget(self.table, 1)
+        root.addLayout(body, 1)
         root.addSpacing(12)
 
         # 상태바
@@ -2647,6 +2873,7 @@ class MainWindow(QMainWindow):
         self.config_path_label.setToolTip(str(DATA_FILE))
 
         status_row.addWidget(self.status_label)
+        status_row.addSpacing(16)
         status_row.addStretch()
         status_row.addWidget(self.config_path_label)
         root.addLayout(status_row)
@@ -2872,15 +3099,285 @@ class MainWindow(QMainWindow):
         dlg.raise_()
         dlg.activateWindow()
 
+    # ── 키워드 그룹 패널 ─────────────────────────────────────────
+    def _build_group_panel(self) -> QWidget:
+        """왼쪽 그룹 패널: 클릭하면 그 그룹만 보기, 체크박스로 그룹 켜기/끄기."""
+        panel = QWidget()
+        panel.setFixedWidth(190)
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+
+        title = QLabel("키워드 그룹")
+        title.setStyleSheet("color:#9370DB; font-weight:700; font-size:12px;")
+        v.addWidget(title)
+
+        self.group_list = QListWidget()
+        self.group_list.setStyleSheet(
+            "QListWidget { background:#141620; border:1px solid #252840;"
+            " border-radius:8px; padding:4px; }"
+            "QListWidget::item { padding:6px 6px; border-radius:5px; }"
+            "QListWidget::item:selected { background:#2A2050; color:#fff; }")
+        self.group_list.setToolTip(
+            "클릭: 해당 그룹의 키워드만 보기\n"
+            "체크 해제: 그 그룹의 키워드를 모두 끄기(목록에는 남음)\n"
+            "더블클릭/우클릭: 이름 변경·삭제")
+        self.group_list.itemChanged.connect(self._on_group_item_changed)
+        self.group_list.currentRowChanged.connect(self._on_group_selected)
+        self.group_list.itemDoubleClicked.connect(
+            lambda *_: self._rename_group())
+        self.group_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.group_list.customContextMenuRequested.connect(self._show_group_menu)
+        v.addWidget(self.group_list, 1)
+
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        add_g = QPushButton("+ 그룹")
+        add_g.setToolTip("새 키워드 그룹을 만듭니다")
+        add_g.clicked.connect(self._add_group)
+        ren_g = QPushButton("이름")
+        ren_g.setObjectName("secondary")
+        ren_g.setToolTip("선택한 그룹 이름 변경")
+        ren_g.clicked.connect(self._rename_group)
+        del_g = QPushButton("삭제")
+        del_g.setObjectName("danger")
+        del_g.setToolTip("선택한 그룹 삭제(키워드는 미분류로 이동)")
+        del_g.clicked.connect(self._delete_group)
+        for b in (add_g, ren_g, del_g):
+            b.setStyleSheet("padding:6px 8px;")
+            row.addWidget(b)
+        v.addLayout(row)
+        return panel
+
+    def _group_counts(self):
+        counts = {}
+        for r in self.rules:
+            g = rule_group(r)
+            counts[g] = counts.get(g, 0) + 1
+        return counts
+
+    def _refresh_groups(self):
+        """그룹 목록을 다시 그린다(선택·체크 상태 유지)."""
+        self.group_order = all_groups(self.rules, self.group_order)
+        counts = self._group_counts()
+        lst = self.group_list
+        lst.blockSignals(True)
+        lst.clear()
+        self._group_rows = [None]
+        all_item = QListWidgetItem(f"전체  ({len(self.rules)})")
+        all_font = QFont("Segoe UI")
+        all_font.setBold(True)
+        all_item.setFont(all_font)
+        lst.addItem(all_item)
+        names = list(self.group_order)
+        if counts.get("", 0) or not names:
+            names.append("")  # 미분류는 키워드가 있을 때만(그룹이 없으면 항상)
+        for g in names:
+            label = g if g else UNGROUPED_LABEL
+            item = QListWidgetItem(f"{label}  ({counts.get(g, 0)})")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            on = g not in self.disabled_groups
+            item.setCheckState(Qt.CheckState.Checked if on
+                               else Qt.CheckState.Unchecked)
+            if not on:
+                item.setForeground(QColor("#666"))
+                item.setToolTip("꺼짐 — 이 그룹의 키워드는 동작하지 않습니다")
+            lst.addItem(item)
+            self._group_rows.append(g)
+        if self.group_filter not in self._group_rows:
+            self.group_filter = None
+        lst.setCurrentRow(self._group_rows.index(self.group_filter))
+        lst.blockSignals(False)
+
+    def _save_group_settings(self):
+        self.settings["groups"] = list(self.group_order)
+        self.settings["disabled_groups"] = sorted(self.disabled_groups)
+        save_settings(self.settings)
+
+    def _effective_rules(self):
+        return effective_rules(self.rules, self.disabled_groups)
+
+    def _selected_group(self):
+        """패널에서 선택된 '실제 그룹' 이름(전체·미분류면 None)."""
+        row = self.group_list.currentRow()
+        if 0 <= row < len(self._group_rows):
+            g = self._group_rows[row]
+            if g:
+                return g
+        return None
+
+    def _on_group_selected(self, row):
+        if 0 <= row < len(getattr(self, "_group_rows", [])):
+            self.group_filter = self._group_rows[row]
+            self._refresh_table(groups=False)
+
+    def _on_group_item_changed(self, item):
+        row = self.group_list.row(item)
+        if not (0 <= row < len(self._group_rows)):
+            return
+        g = self._group_rows[row]
+        if g is None:
+            return
+        on = item.checkState() == Qt.CheckState.Checked
+        if on:
+            self.disabled_groups.discard(g)
+        else:
+            self.disabled_groups.add(g)
+        self._save_group_settings()
+        # 리스너에는 즉시 반영(타이머를 기다리지 않음)
+        self.listener.set_rules(self._effective_rules())
+        label = g if g else UNGROUPED_LABEL
+        self.status_label.setText(
+            f"그룹 '{label}' " + ("켜짐" if on else "꺼짐 (키워드 동작 안 함)"))
+        # 체크 변경 시그널 안에서 목록을 다시 그리면 불안정하므로 다음 틱에.
+        QTimer.singleShot(0, self._refresh_table)
+
+    def _show_group_menu(self, pos):
+        item = self.group_list.itemAt(pos)
+        if item is not None:
+            self.group_list.setCurrentItem(item)
+        menu = QMenu(self)
+        menu.addAction("+ 새 그룹").triggered.connect(self._add_group)
+        if self._selected_group():
+            menu.addAction("이름 변경").triggered.connect(self._rename_group)
+            menu.addAction("삭제").triggered.connect(self._delete_group)
+        menu.exec(self.group_list.mapToGlobal(pos))
+
+    def _ask_group_name(self, title, text="", existing=()):
+        while True:
+            name, ok = QInputDialog.getText(self, title, "그룹 이름:", text=text)
+            if not ok:
+                return None
+            name = name.strip()
+            err = validate_group_name(name, existing)
+            if not err:
+                return name
+            QMessageBox.warning(self, "그룹 이름", err)
+            text = name
+
+    def _add_group(self):
+        name = self._ask_group_name("그룹 추가", existing=self.group_order)
+        if not name:
+            return None
+        self.group_order = self.group_order + [name]
+        self._save_group_settings()
+        self.group_filter = name
+        self._refresh_table()
+        self.status_label.setText(f"그룹 '{name}' 추가됨")
+        return name
+
+    def _rename_group(self):
+        old = self._selected_group()
+        if not old:
+            QMessageBox.information(self, "알림", "이름을 바꿀 그룹을 선택하세요.")
+            return
+        others = [g for g in self.group_order if g != old]
+        new = self._ask_group_name("그룹 이름 변경", text=old, existing=others)
+        if not new or new == old:
+            return
+        for r in self.rules:
+            if rule_group(r) == old:
+                r["group"] = new
+        self.group_order = [new if g == old else g for g in self.group_order]
+        if old in self.disabled_groups:
+            self.disabled_groups.discard(old)
+            self.disabled_groups.add(new)
+        self.group_filter = new
+        save_rules(self.rules)
+        self._save_group_settings()
+        self._refresh_table()
+        self.status_label.setText(f"그룹 이름 변경: '{old}' → '{new}'")
+
+    def _delete_group(self):
+        g = self._selected_group()
+        if not g:
+            QMessageBox.information(self, "알림", "삭제할 그룹을 선택하세요.")
+            return
+        n = self._group_counts().get(g, 0)
+        msg = f"'{g}' 그룹을 삭제할까요?"
+        if n:
+            msg += (f"\n\n이 그룹의 키워드 {n}개는 삭제되지 않고 "
+                    f"'{UNGROUPED_LABEL}'로 이동합니다.")
+        if QMessageBox.question(self, "그룹 삭제", msg) != QMessageBox.StandardButton.Yes:
+            return
+        for r in self.rules:
+            if rule_group(r) == g:
+                r["group"] = ""
+        self.group_order = [x for x in self.group_order if x != g]
+        self.disabled_groups.discard(g)
+        self.group_filter = None
+        save_rules(self.rules)
+        self._save_group_settings()
+        self._refresh_table()
+        self.status_label.setText(f"그룹 '{g}' 삭제됨")
+
+    def _move_rule_to_group(self, idx, group):
+        if group is None:  # "새 그룹…"
+            group = self._add_group()
+            if not group:
+                return
+        if 0 <= idx < len(self.rules):
+            self.rules[idx]["group"] = group
+            save_rules(self.rules)
+            self._refresh_table()
+            self.status_label.setText(
+                f'"{self.rules[idx]["trigger"]}" → 그룹 '
+                f"'{group or UNGROUPED_LABEL}'")
+
+    def _show_rule_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        self.table.selectRow(row)
+        idx = self._rule_index_at(row)
+        if idx is None:
+            return
+        menu = QMenu(self)
+        menu.addAction("편집").triggered.connect(self._edit_rule)
+        move = menu.addMenu("그룹 이동")
+        cur = rule_group(self.rules[idx])
+        for g in [""] + list(self.group_order):
+            act = move.addAction(g if g else UNGROUPED_LABEL)
+            act.setCheckable(True)
+            act.setChecked(g == cur)
+            act.triggered.connect(
+                lambda _=False, i=idx, gg=g: self._move_rule_to_group(i, gg))
+        move.addSeparator()
+        move.addAction("새 그룹…").triggered.connect(
+            lambda _=False, i=idx: self._move_rule_to_group(i, None))
+        menu.addSeparator()
+        menu.addAction("삭제").triggered.connect(self._delete_rule)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
     # ── 테이블 갱신 ──────────────────────────────────────────────
-    def _refresh_table(self):
+    def _visible_rule_indices(self):
+        """현재 그룹 필터에 보이는 규칙의 self.rules 인덱스 목록."""
+        if self.group_filter is None:
+            return list(range(len(self.rules)))
+        return [i for i, r in enumerate(self.rules)
+                if rule_group(r) == self.group_filter]
+
+    def _rule_index_at(self, row):
+        item = self.table.item(row, 1)
+        if item is None:
+            return None
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        return idx if isinstance(idx, int) and 0 <= idx < len(self.rules) else None
+
+    def _refresh_table(self, groups=True):
         # ';;' 로 시작하는 규칙을 항상 맨 위로 끌어올린 뒤 그린다.
         if self._apply_priority_order():
             save_rules(self.rules)
+        if groups:
+            self._refresh_groups()
         self.table.setRowCount(0)
         type_colors = {"word": "#7C5CBF", "special": "#2A8FBF", "regex": "#BF7C2A"}
-        for i, rule in enumerate(self.rules):
-            self.table.insertRow(i)
+        for row, i in enumerate(self._visible_rule_indices()):
+            rule = self.rules[i]
+            g = rule_group(rule)
+            group_off = g in self.disabled_groups
+            self.table.insertRow(row)
 
             chk = QCheckBox()
             chk.setChecked(rule.get("enabled", True))
@@ -2890,7 +3387,7 @@ class MainWindow(QMainWindow):
             lay.setContentsMargins(0, 0, 0, 0)
             lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lay.addWidget(chk)
-            self.table.setCellWidget(i, 0, cell)
+            self.table.setCellWidget(row, 0, cell)
 
             type_item = QTableWidgetItem(rule["type"])
             type_item.setForeground(QColor(type_colors.get(rule["type"], "#888")))
@@ -2903,22 +3400,37 @@ class MainWindow(QMainWindow):
             # (정수는 Qt의 드래그&드롭 MIME 직렬화에서 안전하게 보존됨.
             #  규칙 dict 자체를 저장하면 직렬화 과정에서 깨질 수 있음)
             type_item.setData(Qt.ItemDataRole.UserRole, i)
-            self.table.setItem(i, 1, type_item)
-            self.table.setItem(i, 2, QTableWidgetItem(rule["trigger"]))
-            self.table.setItem(i, 3, QTableWidgetItem(rule["output"]))
-            self.table.setRowHeight(i, 40)
+            self.table.setItem(row, 1, type_item)
+            group_item = QTableWidgetItem(g if g else "—")
+            group_item.setForeground(QColor("#7CD6F0" if g else "#555"))
+            self.table.setItem(row, 2, group_item)
+            self.table.setItem(row, 3, QTableWidgetItem(rule["trigger"]))
+            self.table.setItem(row, 4, QTableWidgetItem(rule["output"]))
+            if group_off:
+                # 꺼진 그룹의 키워드는 흐리게 표시(동작하지 않음을 알림)
+                tip = (f"그룹 '{g or UNGROUPED_LABEL}' 이(가) 꺼져 있어 "
+                       "동작하지 않습니다")
+                for c in (2, 3, 4):
+                    it = self.table.item(row, c)
+                    it.setForeground(QColor("#555"))
+                    it.setToolTip(tip)
+            self.table.setRowHeight(row, 40)
 
-        self.listener.set_rules(self.rules)
+        self.listener.set_rules(self._effective_rules())
 
     # ── 드래그로 행 순서 변경 ──────────────────────────────────────
     def _on_table_reordered(self):
         """행 드래그&드롭이 끝난 직후 호출됨.
         각 행에 저장해둔 "원래 인덱스"를 화면에 보이는 새 순서대로
         읽어 self.rules를 재배열하고 즉시 설정 파일에 저장한다.
+        그룹 필터로 일부만 보이는 경우엔 보이는 규칙들끼리만 자리를
+        바꾸고(그 규칙들이 차지하던 위치를 새 순서로 채움) 나머지는 그대로.
         체크박스 등 셀 위젯은 Qt가 자동으로 옮겨주지 않으므로
         새 순서를 기준으로 다시 그린다."""
         old_rules = self.rules
-        new_rules = []
+        visible = self._visible_rule_indices()
+        visible_set = set(visible)
+        order = []
         seen = set()
 
         for row in range(self.table.rowCount()):
@@ -2926,14 +3438,18 @@ class MainWindow(QMainWindow):
             if item is None:
                 continue
             idx = item.data(Qt.ItemDataRole.UserRole)
-            if isinstance(idx, int) and 0 <= idx < len(old_rules) and idx not in seen:
-                new_rules.append(old_rules[idx])
+            if isinstance(idx, int) and idx in visible_set and idx not in seen:
+                order.append(idx)
                 seen.add(idx)
 
         # 누락된 항목이 있으면(예외적 상황) 끝에 보존
-        for idx in range(len(old_rules)):
+        for idx in visible:
             if idx not in seen:
-                new_rules.append(old_rules[idx])
+                order.append(idx)
+
+        new_rules = list(old_rules)
+        for slot, idx in zip(sorted(visible), order):
+            new_rules[slot] = old_rules[idx]
 
         if new_rules != old_rules:
             self.rules = new_rules
@@ -2948,37 +3464,48 @@ class MainWindow(QMainWindow):
         self._edit_rule()
 
     # ── 규칙 CRUD ────────────────────────────────────────────────
+    def _remember_group(self, rule):
+        g = rule_group(rule)
+        if g and g not in self.group_order:
+            self.group_order = self.group_order + [g]
+            self._save_group_settings()
+
     def _add_rule(self):
-        dlg = RuleDialog(self, variables=self.variables)
+        default_group = self.group_filter or ""
+        dlg = RuleDialog(self, variables=self.variables,
+                         groups=self.group_order, default_group=default_group)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             rule = dlg.get_rule()
             if rule["trigger"] and rule["output"]:
                 self.rules.append(rule)
+                self._remember_group(rule)
                 save_rules(self.rules)
                 self._refresh_table()
 
     def _edit_rule(self):
-        row = self.table.currentRow()
-        if row < 0:
+        idx = self._rule_index_at(self.table.currentRow())
+        if idx is None:
             QMessageBox.information(self, "알림", "편집할 규칙을 선택하세요.")
             return
-        dlg = RuleDialog(self, self.rules[row], variables=self.variables)
+        dlg = RuleDialog(self, self.rules[idx], variables=self.variables,
+                         groups=self.group_order)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             new_rule = dlg.get_rule()
-            new_rule["enabled"] = self.rules[row].get("enabled", True)
-            self.rules[row] = new_rule
+            new_rule["enabled"] = self.rules[idx].get("enabled", True)
+            self.rules[idx] = new_rule
+            self._remember_group(new_rule)
             save_rules(self.rules)
             self._refresh_table()
 
     def _delete_rule(self):
-        row = self.table.currentRow()
-        if row < 0:
+        idx = self._rule_index_at(self.table.currentRow())
+        if idx is None:
             QMessageBox.information(self, "알림", "삭제할 규칙을 선택하세요.")
             return
-        trigger = self.rules[row]["trigger"]
+        trigger = self.rules[idx]["trigger"]
         reply = QMessageBox.question(self, "삭제 확인", f'"{trigger}" 규칙을 삭제할까요?')
         if reply == QMessageBox.StandardButton.Yes:
-            self.rules.pop(row)
+            self.rules.pop(idx)
             save_rules(self.rules)
             self._refresh_table()
 
@@ -2986,7 +3513,7 @@ class MainWindow(QMainWindow):
         if idx < len(self.rules):
             self.rules[idx]["enabled"] = bool(state)
             save_rules(self.rules)
-            self.listener.set_rules(self.rules)
+            self.listener.set_rules(self._effective_rules())
 
     # ── 설정 내보내기 / 불러오기 ─────────────────────────────────
     def _export_rules(self):
@@ -3170,7 +3697,7 @@ class MainWindow(QMainWindow):
         self.listener.case_guarantee = bool(
             self.settings.get("output_case_guarantee", True))
         self.listener.set_variables(self.variables)
-        self.listener.set_rules(self.rules)
+        self.listener.set_rules(self._effective_rules())
 
     def _connect_listener_signals(self):
         """UI(트레이/상태바)가 준비된 후 신호 연결 + 후킹 시작"""
