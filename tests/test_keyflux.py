@@ -9,7 +9,9 @@ KeyboardListener 의 실제 치환(_do_replace / _do_replace_norm)은 OS 에 키
 주입하므로, 테스트에서는 이를 가짜 함수로 바꿔 "어떤 트리거가 어떤 extra/via
 로 발동했는지"만 기록해 검증한다.
 """
+import ast
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -21,6 +23,8 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import changelog  # noqa: E402
+import i18n  # noqa: E402
 import main  # noqa: E402
 
 
@@ -1196,6 +1200,8 @@ class TestImeCommitBeforeBackspace(unittest.TestCase):
         self._toggle = main.send_hangul_toggle
         self._send = main.send_text
         self._fg = main.foreground_needs_scancode
+        self._mode = main.hangul_mode_active
+        main.hangul_mode_active = lambda: False
         main.send_text = lambda *a, **k: (self.order.append("type"), True)[1]
         main.ime_restore = lambda saved: self.order.append("restore")
         main.send_hangul_toggle = lambda: (self.order.append("toggle"), True)[1]
@@ -1206,6 +1212,7 @@ class TestImeCommitBeforeBackspace(unittest.TestCase):
         main.send_hangul_toggle = self._toggle
         main.send_text = self._send
         main.foreground_needs_scancode = self._fg
+        main.hangul_mode_active = self._mode
 
     def _listener(self, console):
         main.foreground_needs_scancode = lambda: console
@@ -1231,6 +1238,17 @@ class TestImeCommitBeforeBackspace(unittest.TestCase):
         self.assertEqual(self.order.count("toggle"), 2,
                          "확정용 한 번 + 원복용 한 번")
         self.assertLess(self.order.index("toggle"), self.order.index("bs"))
+
+    def test_console_korean_mode_uses_real_key_to_keep_language(self):
+        # conhost·WT 는 메시지로 복원하면 실제 입력이 영문으로 남는다.
+        main.hangul_mode_active = lambda: True
+        main.ime_force_alphanumeric = lambda: self.order.append("force")
+        for composing in (True, False):
+            self.order.clear()
+            L = self._listener(console=True)
+            L._inject_replacement("t", "OUT", "OUT", 2, composing=composing)
+            self.assertEqual(self.order.count("toggle"), 2)
+            self.assertNotIn("force", self.order)
 
     def test_gui_composing_always_uses_hangul_key(self):
         # Chromium 은 변환모드 질의엔 '한글'이라 답하고 설정은 무시한다 →
@@ -1383,7 +1401,10 @@ class TestPendingScreen(unittest.TestCase):
     def test_korean_breaking_char_marks_composing(self):
         s = self._raw(self._sim(), "a ;;dㅎ")
         self.assertTrue(s.cap.get("composing"))
-        self.assertEqual(s.screen_after(), "a DATEㅎ")
+        # ㅎ 은 완성 글자로 찍으면 뒤 모음과 못 합쳐지므로 실제 키(G)로 다시 친다.
+        self.assertEqual(s.screen_after(), "a DATE")
+        self.assertEqual([vk for vk, _, fl in s.L._blocked_keys
+                          if not fl & main._KEYEVENTF_KEYUP], [ord("G")])
 
     def test_long_keyword_in_korean_mode_keeps_space(self):
         s = self._sim()
@@ -1431,6 +1452,8 @@ class TestMainWindowGroups(unittest.TestCase):
         main.SETTINGS_FILE = d / "settings.json"
         main.VARIABLES_FILE = d / "vars.json"
         main.ensure_startup = lambda settings: False
+        # 실행 PC 의 시스템 언어와 무관하게 한국어 문구로 검증한다.
+        main.save_settings({**main.DEFAULT_SETTINGS, "language": "ko"})
         self._start = main.KeyboardListener.start
         main.KeyboardListener.start = lambda self: None
         main.save_rules([
@@ -1558,6 +1581,310 @@ class _RecordingController:
 
     def type(self, text):
         self.order.append("type")
+
+
+# ── 실제 후크 입력: 한글 모드에서도 영문 키가 들어온다(v1.0.8) ──────
+class TestHangulModeFromRawKeys(unittest.TestCase):
+    """저수준 후크는 IME 이전 단계라 한글 모드에서도 'c','l' 을 준다. 위쪽
+    테스트들처럼 자모를 직접 넣으면 이 경로가 검증되지 않으므로, 여기서는
+    실제와 같은 KeyCode(vk, 영문)를 넣는다."""
+
+    def setUp(self):
+        self._mode = main.hangul_mode_active
+        self.hangul = True
+        main.hangul_mode_active = lambda: self.hangul
+
+    def tearDown(self):
+        main.hangul_mode_active = self._mode
+
+    def _run(self, rules, keys, buffer=""):
+        L = main.KeyboardListener()
+        L.set_rules(rules)
+        L.buffer, L.composed = buffer, buffer
+        cap = {}
+
+        def fake_inject(trigger, to_type, resolved, bs, composing=False):
+            cap.update(to_type=to_type, bs=bs, composing=composing)
+
+        L._inject_replacement = fake_inject
+        for c in keys:
+            if c == " ":
+                L._on_press(main.Key.space)
+            elif c == "<":
+                L._on_press(main.Key.backspace)
+            elif c == "\n":
+                L._on_press(main.Key.enter)
+            elif c == "^":
+                L._on_press(main.keyboard.KeyCode(vk=0x15))
+                self.hangul = not self.hangul
+            elif c.isascii() and c.isalpha():
+                L._on_press(main.keyboard.KeyCode(vk=ord(c.upper()), char=c))
+            else:
+                L._on_press(main.keyboard.KeyCode(vk=0xBA, char=c))
+        deadline = time.monotonic() + 2
+        while L._replacing and not cap and time.monotonic() < deadline:
+            time.sleep(0.005)
+        return L, cap
+
+    @staticmethod
+    def _rule(trigger, output="OUT", kind="special"):
+        return {"type": kind, "trigger": trigger, "output": output, "enabled": True}
+
+    def test_backspaces_match_screen(self):
+        for rule, keys, bs in (
+            (self._rule(";;cl"), "dkssud. ;;cl", 3),           # ;;치
+            (self._rule(";;dkssud"), "gksrmf ;;dkssud", 4),    # ;;안녕
+            (self._rule(";;안녕"), "gksrmf ;;dkssud", 4),
+            (self._rule(";;cl!"), "dkssud ;;cl!", 4),          # ;;치!
+            (self._rule(";;rt"), "dkssud ;;rt", 3),            # ;;ㄳ
+            (self._rule("abc", kind="word"), "dkssud abc ", 2),  # 뮻 + 공백
+        ):
+            _, cap = self._run([rule], keys)
+            self.assertEqual(cap.get("bs"), bs, keys)
+
+    def test_composing_only_when_ime_still_composes(self):
+        _, cap = self._run([self._rule(";;cl")], " ;;cl")
+        self.assertTrue(cap["composing"])
+        _, cap = self._run([self._rule(";;cl!")], " ;;cl!")
+        self.assertFalse(cap["composing"])
+
+    def test_preceding_space_stays_in_buffer(self):
+        L, _ = self._run([self._rule(";;cl")], "dkssud ;;cl")
+        self.assertEqual(L.composed, "안녕 OUT")
+
+    def test_english_mode_is_untouched(self):
+        self.hangul = False
+        L, cap = self._run([self._rule(";;cl")], "hi ;;cl")
+        self.assertEqual(cap["bs"], 4)
+        self.assertEqual(L.composed, "hi OUT")
+
+    def test_injected_unicode_is_not_converted(self):
+        L = main.KeyboardListener()
+        L._on_press(main.keyboard.KeyCode.from_char("a"))
+        self.assertEqual(L.buffer, "a", "VK_PACKET 은 IME 를 거치지 않는다")
+
+    def test_arguments_are_korean(self):
+        _, cap = self._run([self._rule(";;m", "[{1}]")], ";;m ghd\n")
+        self.assertEqual(cap["to_type"], "[홍]")
+        self.assertEqual(cap["bs"], 6)  # ";;ㅡ 홍" + Enter
+
+    def test_hangul_key_does_not_cancel_capture(self):
+        _, cap = self._run([self._rule(";;m", "[{1}]")], ";;m gh^abc\n")
+        self.assertEqual(cap["to_type"], "[호abc]")
+
+    def test_backspace_unit_follows_ime(self):
+        for keys, screen in (
+            ("dks<", "아"),          # 조합 중: 자모 하나
+            ("dks <<", ""),          # 확정 후: 글자 하나
+            ("dhk<", "오"),          # 이중모음은 단계적으로
+            ("rksk<", "가ㄴ"),       # 앞 글자로 되돌아가 합쳐지지 않는다
+        ):
+            L, _ = self._run([], keys)
+            self.assertEqual(L.composed, screen, keys)
+
+    def test_committed_jamo_does_not_merge_again(self):
+        L, _ = self._run([], "z^^k")
+        self.assertEqual(L.composed, "ㅋㅏ")
+
+    def test_particle_after_short_keyword_is_retyped_as_key(self):
+        L, cap = self._run([self._rule(";;d"), self._rule(";;dev", "X")], ";;ds")
+        self.assertEqual((cap["bs"], cap["to_type"]), (4, "OUT"))
+        self.assertEqual([vk for vk, _, fl in L._blocked_keys
+                          if not fl & main._KEYEVENTF_KEYUP], [ord("S")])
+
+    def test_compose_matches_measured_ime(self):
+        # Microsoft 한글 IME 에서 실제로 측정한 결과.
+        for keys, screen in (("rt", "ㄳ"), ("rtk", "ㄱ사"), ("hk", "ㅘ"),
+                             ("ml", "ㅢ"), ("rkE", "가ㄸ"), ("djEj", "어떠")):
+            jamo = "".join(main.key_to_jamo(c) for c in keys)
+            self.assertEqual(main.compose_hangul(jamo), screen, keys)
+
+
+# ── Enter / Shift+Enter 구분 ───────────────────────────────────────
+class TestLineBreakKeys(unittest.TestCase):
+    def test_newline_is_shift_enter_by_default(self):
+        self.assertEqual(main.resolve_output("a\nb"), "a" + main.KEY_SHIFT_ENTER + "b")
+
+    def test_enter_token(self):
+        self.assertEqual(main.resolve_output("a{enter}b"), "a\rb")
+        self.assertEqual(main.resolve_output("a{enter}\nb"), "a\rb")
+        self.assertEqual(main.resolve_output("a{enter}\n\nb"), "a\r\nb")
+        self.assertEqual(main.resolve_output("{{enter}}"), "{enter}")
+
+    def test_only_the_template_can_send(self):
+        self.assertEqual(main.resolve_output("a\r\nb"), "a\nb")
+        self.assertEqual(main.resolve_output("{v}", variables={"v": "x\r\ny"}), "x\ny")
+        self.assertEqual(main.resolve_output("{1}", args=["{enter}"]), "{enter}")
+
+    def test_enter_is_reserved(self):
+        self.assertTrue(main.validate_variable_name("enter"))
+
+    def test_word_retypes_the_key_user_pressed(self):
+        for shift, expected in ((False, "X\r"), (True, "X\n")):
+            L = main.KeyboardListener()
+            L.set_rules([{"type": "word", "trigger": "abc", "output": "X",
+                          "enabled": True}])
+            got = threading.Event()
+            typed = []
+            L._inject_replacement = lambda t, to_type, *a: (typed.append(to_type), got.set())
+            L.buffer = L.composed = "abc"
+            L._enter_shift = shift
+            L._on_press(main.Key.enter)
+            self.assertTrue(got.wait(2))
+            self.assertEqual(typed, [expected])
+
+    @unittest.skipUnless(sys.platform == "win32", "win32 전용")
+    def test_key_events(self):
+        orig = main.key_is_down
+        up = main._KEYEVENTF_KEYUP
+        try:
+            main.key_is_down = lambda vk: False
+            plain = main._char_key_events("\r")
+            soft = main._char_key_events("\n")
+            self.assertEqual([e[0] for e in plain], [0x0D, 0x0D])
+            self.assertEqual([e[0] for e in soft], [0x10, 0x0D, 0x0D, 0x10])
+
+            main.key_is_down = lambda vk: vk == 0xA0  # 왼쪽 Shift 를 누른 채
+            plain = main._char_key_events("\r")
+            self.assertEqual([e[0] for e in plain], [0xA0, 0x0D, 0x0D, 0xA0])
+            self.assertTrue(plain[0][2] & up, "Enter 전에 Shift 를 뗀다")
+            self.assertFalse(plain[-1][2] & up, "끝나면 되돌린다")
+            self.assertEqual([e[0] for e in main._char_key_events("\n")], [0x0D, 0x0D])
+        finally:
+            main.key_is_down = orig
+
+    def test_editor_records_each_key(self):
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication.instance() or QApplication([])
+        d = main.RuleDialog()
+        e, key, shift = (d.output_edit, main.Qt.Key.Key_Return,
+                         main.Qt.KeyboardModifier.ShiftModifier)
+        QTest.keyClicks(e, "a")
+        QTest.keyClick(e, key)                  # 기본 = Shift+Enter
+        QTest.keyClicks(e, "b")
+        d.break_combo.setCurrentIndex(1)
+        QTest.keyClick(e, key)                  # Enter
+        QTest.keyClicks(e, "c")
+        QTest.keyClick(e, key, shift)           # 언제나 Shift+Enter
+        self.assertEqual(d.get_rule()["output"], "a\nb{enter}\nc\n")
+        self.assertEqual(main.resolve_output(d.get_rule()["output"]), "a\nb\rc\n")
+        self.assertEqual(main.RuleDialog().break_combo.currentIndex(), 0)
+        app.processEvents()
+
+
+# ── 다국어 · 패치 내역 ─────────────────────────────────────────────
+class TestI18n(unittest.TestCase):
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def tearDown(self):
+        i18n.set_language("ko")
+
+    def _tr_calls(self):
+        tree = ast.parse((self.ROOT / "main.py").read_text(encoding="utf-8"))
+        return [n for n in ast.walk(tree)
+                if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "tr"]
+
+    def test_every_ui_string_is_translated(self):
+        for call in self._tr_calls():
+            self.assertIn(call.args[0].value, i18n._T, f"main.py:{call.lineno}")
+
+    def test_translations_keep_placeholders(self):
+        for call in self._tr_calls():
+            for text in i18n._T[call.args[0].value]:
+                for kw in call.keywords:
+                    self.assertIn("{%s}" % kw.arg, text, f"main.py:{call.lineno}")
+
+    def test_all_languages_present(self):
+        for key, values in i18n._T.items():
+            self.assertEqual(len(values), len(i18n.LANGUAGES) - 1, key)
+            self.assertTrue(all(values), key)
+
+    def test_resolve_language(self):
+        r = i18n.resolve_language
+        self.assertEqual(r("auto", ["ko-Kore-KR"]), "ko")
+        self.assertEqual(r("auto", ["ja_JP"]), "ja")
+        self.assertEqual(r("auto", ["zh-Hans-CN"]), "zh")
+        self.assertEqual(r("auto", ["de-DE"]), "en")
+        self.assertEqual(r("auto", []), "en")
+        self.assertEqual(r("en", ["ko-KR"]), "en")
+
+    def test_substitution_leaves_syntax_alone(self):
+        i18n.set_language("en")
+        self.assertEqual(i18n.tr("'{name}' 변수가 이미 있습니다.", name="{date}"),
+                         "Variable '{date}' already exists.")
+        self.assertIn("{date:%Y%m%d}", main._placeholder_help_html())
+
+    def test_help_and_notes_render_in_every_language(self):
+        for code in i18n.LANGUAGES:
+            i18n.set_language(code)
+            self.assertIn("{enter}", main._placeholder_help_html())
+            self.assertIn(f"v{main.APP_VERSION}", main._patch_notes_html())
+
+    def test_reserved_group_names_in_every_language(self):
+        for name in ("Ungrouped", "未分類", "未分组", "All"):
+            self.assertTrue(main.validate_group_name(name), name)
+
+
+class TestChangelog(unittest.TestCase):
+    def test_top_entry_is_current_version(self):
+        self.assertEqual(changelog.CHANGELOG[0][0], main.APP_VERSION)
+
+    def test_descending_and_translated(self):
+        versions = [tuple(map(int, v.split("."))) for v, _, _ in changelog.CHANGELOG]
+        self.assertEqual(versions, sorted(versions, reverse=True))
+        for version, date, notes in changelog.CHANGELOG:
+            self.assertRegex(date, re.compile(r"^\d{4}-\d{2}-\d{2}$"))
+            self.assertEqual(set(notes), set(i18n.LANGUAGES), version)
+            self.assertEqual(len({len(v) for v in notes.values()}), 1, version)
+
+    def test_readme_lists_every_version(self):
+        readme = (Path(main.__file__).parent / "README.md").read_text(encoding="utf-8")
+        for version, _, _ in changelog.CHANGELOG:
+            self.assertIn(f"### v{version}", readme)
+
+
+class TestLanguageSwitch(unittest.TestCase):
+    setUpClass = classmethod(TestMainWindowGroups.setUpClass.__func__)
+    setUp = TestMainWindowGroups.setUp
+
+    def tearDown(self):
+        TestMainWindowGroups.tearDown(self)
+        main.apply_language("ko")
+
+    def _switch(self, code):
+        self.w.settings["language"] = code
+        self.w._retranslate()
+
+    def test_switch_without_restart(self):
+        self._switch("en")
+        self.assertEqual(self.w.table.horizontalHeaderItem(3).text(), "Trigger")
+        self.assertTrue(self.w.group_list.item(0).text().startswith("All"))
+        self.assertIn("Patch notes", self.w.version_btn.text())
+        self.assertIn("Quit", [a.text() for a in self.w._tray_menu.actions()])
+        self.assertEqual(self.w.table.rowCount(), 4)
+
+    def test_paused_state_survives_switch(self):
+        self.w._toggle_active()
+        self._switch("ja")
+        self.assertFalse(self.w.listener.active)
+        self.assertEqual(self.w.toggle_btn.text(), "○ 無効")
+
+    def test_switch_from_open_settings(self):
+        self.w._open_settings()
+        self.w.lang_combo.setCurrentIndex(self.w.lang_combo.findData("zh"))
+        self.app.processEvents()
+        self.app.processEvents()
+        self.assertEqual(main.load_settings()["language"], "zh")
+        self.assertTrue(self.w._settings_dialog.isVisible())
+        self.assertIn("设置", self.w._settings_dialog.windowTitle())
+        self.w._settings_dialog.hide()
+
+    def test_ungrouped_is_saved_empty_in_any_language(self):
+        for code in i18n.LANGUAGES:
+            i18n.set_language(code)
+            d = main.RuleDialog(None, groups=["Git"])
+            self.assertEqual(d.get_group(), "", code)
 
 
 if __name__ == "__main__":

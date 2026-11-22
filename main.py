@@ -1,5 +1,6 @@
 import sys
 import os
+import html
 import json
 import re
 import time
@@ -16,14 +17,20 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QPlainTextEdit, QTextBrowser, QListWidget,
     QListWidgetItem, QInputDialog
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
+from PyQt6.QtCore import (
+    Qt, pyqtSignal, QObject, QTimer, QLocale, QTranslator, QLibraryInfo
+)
 from PyQt6.QtGui import QIcon, QColor, QFont, QPixmap, QPainter, QKeySequence, QShortcut
 from pynput import keyboard
 from pynput.keyboard import Key, Controller
 import ctypes
 
+import i18n
+from i18n import tr
+from changelog import CHANGELOG
+
 # 앱 버전 (SemVer). 릴리스 태그 v<버전> 과 일치시킨다.
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 
 
 # ── 유니코드 직접 주입 (Windows SendInput) ───────────────────────
@@ -129,7 +136,15 @@ if sys.platform == "win32":
     _GetKeyState = ctypes.WINFUNCTYPE(wintypes.SHORT, ctypes.c_int)(
         ("GetKeyState", ctypes.windll.user32))
     _VK_CAPITAL = 0x14
-    _SPECIAL_VK = {"\n": 0x0D, "\t": 0x09}  # 줄바꿈/탭은 전용 가상키로
+    _VK_RETURN = 0x0D
+    _VK_LSHIFT, _VK_RSHIFT = 0xA0, 0xA1
+    # 주입 문자열 안에서 "\n" = Shift+Enter(기본 줄바꿈), "\r" = Enter.
+    _SPECIAL_VK = {"\n": _VK_RETURN, "\r": _VK_RETURN, "\t": 0x09}
+    _GetAsyncKeyState = ctypes.WINFUNCTYPE(wintypes.SHORT, ctypes.c_int)(
+        ("GetAsyncKeyState", ctypes.windll.user32))
+
+    def key_is_down(vk: int) -> bool:
+        return bool(_GetAsyncKeyState(vk) & 0x8000)
 
     def _send_key_inputs(events) -> bool:
         """events: (wVk, wScan, dwFlags) 리스트를 단일 SendInput 으로 전송."""
@@ -147,13 +162,23 @@ if sys.platform == "win32":
         """한 글자를 스캔코드 키 이벤트 리스트로 변환.
         키보드로 칠 수 없는 글자면 None(→ 호출자가 유니코드로 폴백).
         case_guarantee=False면 CapsLock 보정을 건너뛴다(아래 참조)."""
-        if ch == "\r":
-            return []
         if ch in _SPECIAL_VK:
             vk = _SPECIAL_VK[ch]
+            down, up = _KEYEVENTF_SCANCODE, _KEYEVENTF_SCANCODE | _KEYEVENTF_KEYUP
             sc = _MapVirtualKeyW(vk, 0)
-            return [(vk, sc, _KEYEVENTF_SCANCODE),
-                    (vk, sc, _KEYEVENTF_SCANCODE | _KEYEVENTF_KEYUP)]
+            evs = [(vk, sc, down), (vk, sc, up)]
+            # 사용자가 트리거 끝 글자(! : 대문자 등) 때문에 Shift 를 아직 누르고
+            # 있을 수 있다. Enter 는 잠깐 떼었다가 되돌리고, Shift+Enter 는 이미
+            # 눌려 있으면 건드리지 않는다(사용자의 Shift 를 풀어 버리지 않게).
+            held = [v for v in (_VK_LSHIFT, _VK_RSHIFT) if key_is_down(v)]
+            if ch == "\r":
+                for v in held:
+                    h = _MapVirtualKeyW(v, 0)
+                    evs = [(v, h, up)] + evs + [(v, h, down)]
+            elif ch == "\n" and not held:
+                h = _MapVirtualKeyW(_VK_SHIFT, 0)
+                evs = [(_VK_SHIFT, h, down)] + evs + [(_VK_SHIFT, h, up)]
+            return evs
         res = _VkKeyScanW(ch)
         if res == -1:
             return None
@@ -173,12 +198,19 @@ if sys.platform == "win32":
             return None
         evs = []
         sh_sc = _MapVirtualKeyW(_VK_SHIFT, 0)
+        held = ([] if shift_state & 1 else
+                [(v, _MapVirtualKeyW(v, 0)) for v in (_VK_LSHIFT, _VK_RSHIFT)
+                 if key_is_down(v)])
+        for v, h in held:  # 누르고 있는 Shift 때문에 대문자·기호로 바뀌지 않게
+            evs.append((v, h, _KEYEVENTF_SCANCODE | _KEYEVENTF_KEYUP))
         if shift_state & 1:
             evs.append((_VK_SHIFT, sh_sc, _KEYEVENTF_SCANCODE))
         evs.append((vk, sc, _KEYEVENTF_SCANCODE))
         evs.append((vk, sc, _KEYEVENTF_SCANCODE | _KEYEVENTF_KEYUP))
         if shift_state & 1:
             evs.append((_VK_SHIFT, sh_sc, _KEYEVENTF_SCANCODE | _KEYEVENTF_KEYUP))
+        for v, h in held:
+            evs.append((v, h, _KEYEVENTF_SCANCODE))
         return evs
 
     def send_text(text: str, char_delay: float = 0.01,
@@ -237,6 +269,65 @@ if sys.platform == "win32":
     _SendMessageW = ctypes.WINFUNCTYPE(
         ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT,
         wintypes.WPARAM, wintypes.LPARAM)(("SendMessageW", ctypes.windll.user32))
+
+    class _GUITHREADINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+            ("hwndActive", wintypes.HWND), ("hwndFocus", wintypes.HWND),
+            ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
+            ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND),
+            ("rcCaret", wintypes.RECT),
+        ]
+
+    _GetGUIThreadInfo = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.DWORD, ctypes.POINTER(_GUITHREADINFO))(
+        ("GetGUIThreadInfo", ctypes.windll.user32))
+    _GetWindowThreadProcessId = ctypes.WINFUNCTYPE(
+        wintypes.DWORD, wintypes.HWND, ctypes.c_void_p)(
+        ("GetWindowThreadProcessId", ctypes.windll.user32))
+    _GetKeyboardLayout = ctypes.WINFUNCTYPE(wintypes.HKL, wintypes.DWORD)(
+        ("GetKeyboardLayout", ctypes.windll.user32))
+    _SendMessageTimeoutW = ctypes.WINFUNCTYPE(
+        ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+        wintypes.LPARAM, wintypes.UINT, wintypes.UINT,
+        ctypes.POINTER(ctypes.c_size_t))(
+        ("SendMessageTimeoutW", ctypes.windll.user32))
+    _SMTO_ABORTIFHUNG = 0x0002
+    _IME_QUERY_TIMEOUT_MS = 50
+    _LANG_KOREAN = 0x12
+
+    def hangul_mode_active() -> bool:
+        """지금 입력 중인 창이 "한글 모드"인가.
+
+        저수준 후크는 IME '이전' 단계라 한글 모드에서도 영문 키(c, l)만 보인다.
+        이 값이 있어야 화면에 실제로 보이는 글자(치)를 재구성할 수 있다.
+        글자 키마다 부르므로 응답 없는 창에 매달리지 않게 시간 제한을 둔다.
+        알 수 없으면 False."""
+        try:
+            hwnd = _GetForegroundWindow()
+            if not hwnd:
+                return False
+            info = _GUITHREADINFO(cbSize=ctypes.sizeof(_GUITHREADINFO))
+            if _GetGUIThreadInfo(0, ctypes.byref(info)) and info.hwndFocus:
+                hwnd = info.hwndFocus
+            layout = _GetKeyboardLayout(_GetWindowThreadProcessId(hwnd, None))
+            # NATIVE 비트는 일본어·중국어 IME 에서도 켜지므로 한국어만 인정한다.
+            # (콘솔 창은 레이아웃이 0 으로 나올 수 있어 그때는 모드만 본다)
+            if layout and (layout & 0x3FF) != _LANG_KOREAN:
+                return False
+            ime = _ImmGetDefaultIMEWnd(hwnd)
+            if not ime:
+                return False
+            mode = ctypes.c_size_t(0)
+            if not _SendMessageTimeoutW(
+                    ime, _WM_IME_CONTROL, _IMC_GETCONVERSIONMODE, 0,
+                    _SMTO_ABORTIFHUNG, _IME_QUERY_TIMEOUT_MS,
+                    ctypes.byref(mode)):
+                return False
+            return bool(mode.value & _IME_CMODE_NATIVE)
+        except Exception as e:
+            dbg(f"hangul_mode_active error {e!r}")
+            return False
 
     def ime_force_alphanumeric():
         """포그라운드 창의 IME가 한글 모드면 영문으로 바꾸고, 복원에 필요한
@@ -336,7 +427,29 @@ if sys.platform == "win32":
         때와 같아진다."""
         if not events:
             return True
-        return _send_key_inputs(events)
+        ok, batch = True, []
+        for ev in events:
+            batch.append(ev)
+            if ev[0] == _VK_HANGUL and ev[2] & _KEYEVENTF_KEYUP:
+                # 한/영 전환이 반영되기 전에 다음 글자의 모드를 읽지 않도록.
+                ok = _send_key_inputs(batch) and ok
+                batch = []
+                time.sleep(0.03)
+        return (not batch or _send_key_inputs(batch)) and ok
+
+    def letter_key_events(keys):
+        """(영문 글자, Shift 여부) 목록을 실제 키 이벤트로 바꾼다."""
+        sh = _MapVirtualKeyW(_VK_SHIFT, 0)
+        out = []
+        for letter, shifted in keys:
+            vk = ord(letter.upper())
+            sc = _MapVirtualKeyW(vk, 0)
+            evs = [(vk, sc, 0), (vk, sc, _KEYEVENTF_KEYUP)]
+            if shifted:
+                evs = ([(_VK_SHIFT, sh, 0)] + evs
+                       + [(_VK_SHIFT, sh, _KEYEVENTF_KEYUP)])
+            out += evs
+        return out
 
     # ── 단일 실행 보장 (named mutex) ──────────────────────────────
     # QSharedMemory 는 강제종료/크래시 시 잠금이 OS 에 남아(leak) 다음 실행을
@@ -367,6 +480,15 @@ else:
 
     def ime_force_alphanumeric():
         return None
+
+    def hangul_mode_active() -> bool:
+        return False
+
+    def key_is_down(vk: int) -> bool:
+        return False
+
+    def letter_key_events(keys):
+        return []
 
     def send_hangul_toggle() -> bool:
         return False
@@ -432,8 +554,13 @@ def save_rules(rules):
 # 그룹 목록의 순서·빈 그룹·꺼진 그룹은 설정 파일(groups / disabled_groups)에
 # 보관하고, 그룹 이름 자체는 규칙과 함께 rules.json 에 저장돼 내보내기/
 # 불러오기 때 같이 따라간다.
-UNGROUPED_LABEL = "미분류"
-_RESERVED_GROUP_NAMES = {UNGROUPED_LABEL, "전체", "(미분류)"}
+# 표시 언어가 바뀌어도 겹치지 않게 모든 언어의 예약 표기를 막는다.
+_RESERVED_GROUP_NAMES = set().union(
+    *(i18n.translations(t) for t in ("미분류", "전체", "(미분류)")))
+
+
+def ungrouped_label() -> str:
+    return tr("미분류")
 
 
 def rule_group(rule) -> str:
@@ -464,11 +591,11 @@ def validate_group_name(name: str, existing=()) -> str:
     """그룹명이 유효하면 "", 아니면 사용자에게 보여줄 오류 사유."""
     name = (name or "").strip()
     if not name:
-        return "그룹 이름을 입력하세요."
+        return tr("그룹 이름을 입력하세요.")
     if name in _RESERVED_GROUP_NAMES:
-        return f"'{name}' 은(는) 그룹 이름으로 쓸 수 없습니다."
+        return tr("'{name}' 은(는) 그룹 이름으로 쓸 수 없습니다.", name=name)
     if name in existing:
-        return f"'{name}' 그룹이 이미 있습니다."
+        return tr("'{name}' 그룹이 이미 있습니다.", name=name)
     return ""
 
 
@@ -504,6 +631,8 @@ DEFAULT_SETTINGS = {
     # 키워드 그룹 표시 순서(빈 그룹 포함)와 꺼 둔 그룹 목록("" = 미분류).
     "groups": [],
     "disabled_groups": [],
+    # 표시 언어: "auto"(시스템 언어) 또는 i18n.LANGUAGES 의 코드.
+    "language": "auto",
 }
 
 def load_settings():
@@ -534,7 +663,7 @@ VARIABLES_FILE = DATA_FILE.parent / (
 )
 
 # 변수명으로 쓸 수 없는 예약어(플레이스홀더 키와 충돌).
-_RESERVED_VAR_NAMES = {"date", "time", "datetime"}
+_RESERVED_VAR_NAMES = {"date", "time", "datetime", "enter"}
 
 
 def load_variables() -> dict:
@@ -567,15 +696,15 @@ def validate_variable_name(name: str) -> str:
     - date/time/datetime 예약어 금지"""
     name = (name or "").strip()
     if not name:
-        return "변수명을 입력하세요."
+        return tr("변수명을 입력하세요.")
     if any(c in name for c in "{}:"):
-        return "변수명에 { } : 기호는 쓸 수 없습니다."
+        return tr("변수명에 { } : 기호는 쓸 수 없습니다.")
     if name.isdigit():
-        return "숫자만으로 된 변수명은 위치 인자({1},{2}…)와 충돌합니다."
+        return tr("숫자만으로 된 변수명은 위치 인자({1},{2}…)와 충돌합니다.")
     if name == "*":
-        return "'*' 는 전체 인자({*})에 예약되어 있습니다."
+        return tr("'*' 는 전체 인자({*})에 예약되어 있습니다.")
     if name in _RESERVED_VAR_NAMES:
-        return f"'{name}' 은(는) 예약어(날짜/시간)입니다."
+        return tr("'{name}' 은(는) 예약어입니다.", name=name)
     return ""
 
 # ── 관리자 권한 확인 ──────────────────────────────────────────────
@@ -652,11 +781,12 @@ def _startup_task_xml() -> str:
     user = _current_user_id()
     esc = lambda s: (s.replace("&", "&amp;").replace("<", "&lt;")
                      .replace(">", "&gt;"))
+    description = esc(tr("KeyFlux - 키 입력 자동 변환기 (로그인 시 자동 실행)"))
     arg_el = f"\n      <Arguments>{esc(args)}</Arguments>" if args else ""
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>KeyFlux - 키 입력 자동 변환기 (로그인 시 자동 실행)</Description>
+    <Description>{description}</Description>
     <URI>\\{_TASK_NAME}</URI>
   </RegistrationInfo>
   <Triggers>
@@ -830,7 +960,7 @@ def set_startup(enabled: bool) -> bool:
     global _startup_last_error
     _startup_last_error = ""
     if sys.platform != "win32":
-        _startup_last_error = "Windows 에서만 지원합니다."
+        _startup_last_error = tr("Windows 에서만 지원합니다.")
         return False
 
     if not enabled:
@@ -935,6 +1065,8 @@ def dbg(msg: str):
 #   {*}                        : 인자 전체(내부 공백 보존)
 #   {이름}                     : 미리 정의한 재사용 변수(설정 창에서 관리)
 #   {{ }}                      : 리터럴 중괄호(이스케이프)
+#   {enter}                    : Enter 키. 바로 뒤 줄바꿈 1개는 같은 것으로 본다
+#   줄바꿈                      : Shift+Enter (기본 줄바꿈)
 #
 # 해석 우선순위: ① date/time/datetime → ② 숫자 키(위치 인자) →
 #               ③ *(전체 인자) → ④ 변수명 → ⑤ 미해석 시 원본 그대로.
@@ -951,6 +1083,18 @@ _DEFAULT_DT_FORMATS = {
 # 리터럴 중괄호 이스케이프용 내부 임시 토큰(사용자 입력에 나타날 일이 없는 값).
 _ESC_OPEN = "\x00KF_LBRACE\x00"
 _ESC_CLOSE = "\x00KF_RBRACE\x00"
+
+
+ENTER_TOKEN = "{enter}"
+# 치환이 끝난(주입용) 문자열에서의 줄바꿈 표현.
+KEY_ENTER = "\r"
+KEY_SHIFT_ENTER = "\n"
+
+
+def _as_soft_breaks(text: str) -> str:
+    """텍스트에 섞인 CRLF/CR 은 전부 기본 줄바꿈(Shift+Enter)이다.
+    Enter 는 템플릿의 {enter} 로만 만들어진다(변수·인자 값이 전송하지 않게)."""
+    return str(text).replace("\r\n", "\n").replace("\r", "\n")
 
 
 def output_is_parameterized(output: str) -> bool:
@@ -974,11 +1118,15 @@ def resolve_output(output: str, args=None, variables=None,
     all_text = args_all if args_all is not None else " ".join(args)
 
     # 이스케이프({{, }})를 임시 토큰으로 빼서 치환 대상에서 제외한다.
-    work = output.replace("{{", _ESC_OPEN).replace("}}", _ESC_CLOSE)
+    work = (_as_soft_breaks(output)
+            .replace("{{", _ESC_OPEN).replace("}}", _ESC_CLOSE)
+            .replace(ENTER_TOKEN + "\n", ENTER_TOKEN))
 
     def _sub(m):
         key = m.group(1)
         fmt = m.group(2)  # 콜론 뒤(형식/기본값). 없으면 None.
+        if m.group(0) == ENTER_TOKEN:
+            return KEY_ENTER
         # ① 날짜/시간
         if key in _DEFAULT_DT_FORMATS:
             f = fmt if fmt else _DEFAULT_DT_FORMATS[key]
@@ -990,14 +1138,14 @@ def resolve_output(output: str, args=None, variables=None,
         if key.isdigit():
             idx = int(key)
             if 1 <= idx <= len(args):
-                return args[idx - 1]
+                return _as_soft_breaks(args[idx - 1])
             return fmt if fmt is not None else ""
         # ③ 전체 인자({*})
         if key == "*":
-            return all_text
+            return _as_soft_breaks(all_text)
         # ④ 재사용 변수
         if key in variables:
-            return variables[key]
+            return _as_soft_breaks(variables[key])
         # ⑤ 미해석 → 원본 그대로 남김(예: {nope})
         return m.group(0)
 
@@ -1006,8 +1154,9 @@ def resolve_output(output: str, args=None, variables=None,
 
 
 # ── 한글 자모 조합 (두벌식 오토마타) ─────────────────────────────
-# Windows의 전역 키보드 후크는 한글을 "완성된 글자(조합형)"가 아니라
-# "자모 단위(분리형)"로 전달한다 (예: "안" → ㅇ,ㅏ,ㄴ 3개의 키 이벤트).
+# Windows의 전역 키보드 후크는 IME 이전 단계라, 한글 모드에서도 영문 키만
+# 전달한다(예: "안" → d, k, s). 리스너가 한글 모드인 동안 이를 두벌식
+# 자모(ㅇ,ㅏ,ㄴ)로 바꿔 버퍼에 넣는다(key_to_jamo).
 # 트리거 규칙은 보통 완성형 한글("안녕하세요")로 등록되므로, 들어온
 # 자모를 실시간으로 조합해 "화면에 보이는 형태"를 재구성해야 매칭이 된다.
 #
@@ -1055,10 +1204,25 @@ def _make_syllable(cho: str, jung: str, jong: str = "") -> str:
     return chr(0xAC00 + (ci * 21 + vi) * 28 + ji)
 
 
+# "확정된 낱자"(조합이 끝난 ㅋ, ㅏ 등)의 내부 표현.
+# 낱자 그대로 두면 다음 자모와 다시 합쳐지므로 사용자 정의 영역으로 옮겨 둔다.
+# compose_hangul·_norm_char 는 이를 원래 낱자로 되돌려 읽는다.
+_FROZEN_BASE = 0xE000
+_FROZEN_TO_JAMO = {chr(_FROZEN_BASE + i): chr(0x3131 + i) for i in range(0x33)}
+_FREEZE_TABLE = str.maketrans({v: k for k, v in _FROZEN_TO_JAMO.items()})
+
+
+def freeze_text(screen: str) -> str:
+    """화면에 확정된 문자열을, 더는 조합되지 않는 버퍼 표현으로 바꾼다."""
+    return screen.translate(_FREEZE_TABLE)
+
+
 def compose_hangul(raw: str) -> str:
     """두벌식 자모 입력 시퀀스를 화면에 표시되는 형태(조합형)로 변환.
     한글 자모가 아닌 문자(영문/숫자/완성된 한글 음절/기호 등)는
-    그대로 통과시킨다."""
+    그대로 통과시킨다.
+    규칙은 Microsoft 한글 IME 실측과 같다: 초성 없이도 겹자음(ㄱㅅ→ㄳ)·
+    이중모음(ㅗㅏ→ㅘ)이 합쳐지고, ㄸ·ㅃ·ㅉ 은 받침이 되지 않는다."""
     result = []
     cho = jung = jong = None
 
@@ -1079,22 +1243,42 @@ def compose_hangul(raw: str) -> str:
 
         if not is_cho and not is_jung:
             flush()
-            result.append(raw_c)  # 원래 문자 그대로 출력 (정규화 전 형태)
+            # 원래 문자 그대로(확정된 낱자만 표시용으로 되돌림)
+            result.append(_FROZEN_TO_JAMO.get(raw_c, raw_c))
             continue
 
         if cho is None and jung is None:
             if is_cho:
                 cho = c
             else:
-                result.append(c)  # 단독 모음, 즉시 확정
+                jung = c
             continue
 
-        if jung is None:  # 초성만 있음
-            if is_jung:
-                jung = c
+        if cho is None:  # 단독 모음
+            combo = _JUNG_COMBINE.get((jung, c))
+            if combo:
+                jung = combo
             else:
                 flush()
-                cho = c
+                if is_cho:
+                    cho = c
+                else:
+                    jung = c
+            continue
+
+        if jung is None:  # 초성만(또는 겹자음만) 있음
+            if is_jung:
+                if cho in _JONG_SPLIT:
+                    remain, cho = _JONG_SPLIT[cho]
+                    result.append(remain)
+                jung = c
+            else:
+                combo = _JONG_COMBINE.get((cho, c))
+                if combo:
+                    cho = combo
+                else:
+                    flush()
+                    cho = c
             continue
 
         if jong is None:  # 초성+중성 (받침 없음)
@@ -1104,9 +1288,12 @@ def compose_hangul(raw: str) -> str:
                     jung = combo
                 else:
                     flush()
-                    result.append(c)  # 새 음절은 단독 모음으로 즉시 확정
-            else:
+                    jung = c
+            elif c in _JONG_IDX:
                 jong = c
+            else:
+                flush()
+                cho = c
             continue
 
         # 초성+중성+받침
@@ -1181,12 +1368,36 @@ def _jamo_to_keys(j: str):
     return None
 
 
+def key_to_jamo(ch: str) -> str:
+    """한글 모드에서 영문 글자 키가 만드는 자모. 대문자 = Shift 를 누른 키."""
+    low = ch.lower()
+    if ch != low and low in _DUBEOL_SHIFT:
+        return _DUBEOL_SHIFT[low]
+    return _DUBEOL_NORMAL.get(low, ch)
+
+
+_JAMO_PARTS = {v: k for k, v in {**_JUNG_COMBINE, **_JONG_COMBINE}.items()}
+_SHIFTED_JAMO = set(_DUBEOL_SHIFT.values())
+
+
+def split_jamo(ch: str) -> list:
+    """화면의 한 글자를 그 글자를 만든 자모 키 순서로 분해(왔 → ㅇㅗㅏㅆ)."""
+    if "\uac00" <= ch <= "\ud7a3":
+        ci, rest = divmod(ord(ch) - 0xAC00, 21 * 28)
+        vi, ji = divmod(rest, 28)
+        parts = (_CHO[ci], _JUNG[vi], _JONG[ji])
+    else:
+        parts = (ch,)
+    return [j for p in parts if p for j in _JAMO_PARTS.get(p, (p,))]
+
+
 def _norm_char(ch: str) -> str:
     """한 글자를 물리 키 시퀀스(영문 소문자)로 정규화.
     - 완성형 한글 음절은 자모로 분해해 각각 키로 변환
     - 분리형/현대 자모는 키로 변환
     - 영문은 소문자(대소문자 무관)
     - 그 외(숫자·기호·공백 등)는 그대로 통과"""
+    ch = _FROZEN_TO_JAMO.get(ch, ch)
     o = ord(ch)
     if 0xAC00 <= o <= 0xD7A3:  # 완성형 한글 음절
         code = o - 0xAC00
@@ -1262,8 +1473,11 @@ class KeyboardListener(QObject):
         # → 단축어 뒤에 바로 친 띄어쓰기/글자가 사라지지 않는다.
         self._blocked_keys = []
         self._replay_timer = None
-        # 보류 확정 시 _do_replace 에 넘기는 "조합 중" 판단값(1회용).
-        self._composing_hint = None
+        # 보류 확정 시 _do_replace 에 넘기는 (보류 이후 입력분, 확정 키,
+        # 조합 중 여부). 1회용.
+        self._confirm_hint = None
+        # 마지막 Enter 를 누른 순간 Shift 가 눌려 있었는지(후크 필터가 기록).
+        self._enter_shift = False
 
         # ── 빠른 필터링용 인덱스 (set_rules에서 갱신) ──────────────
         # 매 키 입력마다 모든 규칙을 endswith()로 검사하지 않고,
@@ -1493,6 +1707,14 @@ class KeyboardListener(QObject):
         except AttributeError:
             ch = None
 
+        # 후크는 IME 이전의 영문 키만 준다 → 한글 모드면 자모로 바꿔야 버퍼가
+        # 화면과 같아지고, 지울 글자 수(백스페이스)가 맞는다.
+        # (가상키가 없는 유니코드 주입 글자는 IME 를 안 거치므로 그대로)
+        if (ch and ch.isascii() and ch.isalpha()
+                and 0x41 <= (getattr(key, "vk", None) or 0) <= 0x5A
+                and hangul_mode_active()):
+            ch = key_to_jamo(ch)
+
         # 인자 캡처 중이면 모든 키를 캡처 처리기로 넘긴다(다른 트리거 매칭 정지).
         if self._capturing is not None:
             self._handle_capture_key(key, ch)
@@ -1503,18 +1725,24 @@ class KeyboardListener(QObject):
             if key in (Key.space, Key.enter):
                 dbg(f"key {'SPACE' if key == Key.space else 'ENTER'} "
                     f"buf={self.buffer[-24:]!r}")
-                self._check_and_replace(append=" " if key == Key.space else "\n")
+                if key == Key.space:
+                    append = " "
+                else:
+                    # 사용자가 친 그 키로 되돌려 찍는다(Enter ↔ Shift+Enter).
+                    append = KEY_SHIFT_ENTER if self._enter_shift else KEY_ENTER
+                self._check_and_replace(append=append)
             elif key == Key.backspace:
-                self.buffer = self.buffer[:-1]
-                self.composed = compose_hangul(self.buffer)
                 # 보류 중이던 짧은 트리거 자체를 지우기 시작했으면 보류 해제
-                if self._pending and len(self.buffer) < self._pending_len:
+                if self._pending and self._erases_into(self._pending_len):
                     self._pending = None
+                self._erase_last()
             elif self._is_passive_key(key):
                 # Shift·CapsLock·한/영 같은 "글자를 만들지 않는" 키는 입력
                 # 흐름을 끊지 않는다. 예전엔 이 키들도 버퍼를 비워서
                 # ① 대문자/기호를 치려고 Shift 를 누르면 앞 문맥이 사라지고
                 # ② ";;" 까지 친 뒤 한/영을 바꾸면 트리거가 아예 안 먹었다.
+                if self._key_vk(key) in self._COMMIT_VKS:
+                    self._commit_composition()
                 return
             else:
                 self.buffer = ""
@@ -1539,14 +1767,64 @@ class KeyboardListener(QObject):
     # 제어문자(\x03 등)로 들어와 별도로 걸러지므로 여기선 Shift 류만 허용한다.
     _PASSIVE_VKS = {0x10, 0xA0, 0xA1, 0x14, 0x15, 0x19}
 
+    # 누르면 IME 조합이 확정되는 키(한/영, 한자).
+    _COMMIT_VKS = {0x15, 0x19}
+
+    @staticmethod
+    def _key_vk(key):
+        vk = getattr(key, "vk", None)
+        if vk is None:
+            vk = getattr(getattr(key, "value", None), "vk", None)
+        return vk
+
     @classmethod
     def _is_passive_key(cls, key) -> bool:
         if key in (Key.shift, Key.shift_l, Key.shift_r, Key.caps_lock):
             return True
-        vk = getattr(key, "vk", None)
-        if vk is None:
-            vk = getattr(getattr(key, "value", None), "vk", None)
-        return vk in cls._PASSIVE_VKS
+        return cls._key_vk(key) in cls._PASSIVE_VKS
+
+    # ── 화면과 같은 버퍼 유지 ────────────────────────────────────
+    # 버퍼 = (확정된 화면 글자) + (지금 조합 중인 자모). 버퍼 끝이 자모면
+    # IME 가 조합 중이라는 뜻이다.
+    def _rebase(self, new_buffer: str):
+        """앞부분을 화면 글자 단위로 접은 새 버퍼로 바꾸고, 버퍼 위치를
+        가리키던 값(보류·인자 캡처)도 같은 글자를 가리키게 옮긴다."""
+        old = self.buffer
+
+        def span(end, size):
+            new_end = len(compose_hangul(old[:end]))
+            return new_end, new_end - len(compose_hangul(old[:max(0, end - size)]))
+
+        if self._pending:
+            self._pending_len, self._pending_trig_raw_len = span(
+                self._pending_len, self._pending_trig_raw_len)
+        cap = self._capturing
+        if cap:
+            cap["start_len"], cap["trig_raw_len"] = span(
+                cap["start_len"], cap["trig_raw_len"])
+        self.buffer = new_buffer
+        self.composed = compose_hangul(new_buffer)
+
+    def _commit_composition(self):
+        """조합 중이던 글자를 확정한다(뒤 자모와 더는 합쳐지지 않는다)."""
+        if is_jamo(self.buffer[-1:]):
+            self._rebase(freeze_text(compose_hangul(self.buffer)))
+
+    def _erases_into(self, end: int) -> bool:
+        """지금 백스페이스를 누르면 버퍼 위치 end 앞까지 지워지는가."""
+        return (len(self.buffer) <= end
+                or len(compose_hangul(self.buffer))
+                <= len(compose_hangul(self.buffer[:end])))
+
+    def _erase_last(self):
+        """IME 와 같은 단위로 지운다: 조합 중이면 자모 하나, 아니면 한 글자."""
+        if not self.buffer:
+            return
+        screen = compose_hangul(self.buffer)
+        rest = ""
+        if is_jamo(self.buffer[-1:]):
+            rest = "".join(split_jamo(screen[-1])[:-1])
+        self._rebase(freeze_text(screen[:-1]) + rest)
 
     def _check_immediate(self):
         if not self.buffer:
@@ -1700,7 +1978,7 @@ class KeyboardListener(QObject):
                         self._do_replace(m.group(0), rule["output"], extra=append, via="composed")
                         return
 
-        self.buffer += append
+        self.buffer += _as_soft_breaks(append)
         self.composed = compose_hangul(self.buffer)
 
     # ── 인라인 인자 캡처 상태머신 ─────────────────────────────────
@@ -1727,21 +2005,30 @@ class KeyboardListener(QObject):
 
         if not output_is_parameterized(p_out):
             # 비파라미터: 보류 이후 입력분 + 스페이스/엔터를 그대로 다시 찍는다.
-            # 보류 이후 입력분(tail)은 화면에 이미 찍혀 있으므로, 버퍼를 트리거
-            # 끝까지로 잘라 '트리거만' 정확히 계산하게 하고, tail 은 화면 형태로
-            # extra 에 실어 지운 뒤 다시 찍는다. (예전엔 tail 이 버퍼 끝에 붙은
-            # 채로 계산해 트리거 길이 판정이 어긋나고 버퍼가 화면과 달라졌다.)
+            # 버퍼를 트리거 끝까지로 자르고, 이후 입력분(tail)은 힌트로 넘겨
+            # _do_replace 가 "화면 전체" 기준으로 지울 수를 세게 한다(tail 의
+            # 자모는 트리거 끝 글자와 합쳐져 보일 수 있다: ;;ㅇ + ㅏ → ;;아).
             tail_raw = self.buffer[self._pending_len:]
             # 스페이스/엔터는 조합을 확정시키므로 그땐 조합 중이 아니다.
             composing = (not append) and is_jamo((tail_raw or self.buffer)[-1:])
+            retype = tail_raw
+            if composing:
+                # 끝의 조합 중 자모는 완성 글자로 찍으면 다음 자모와 못 합쳐진다
+                # ("오늘" + ㄴ + ㅡㄴ → "오늘는"). 치환 뒤 실제 키로 다시 친다.
+                while is_jamo(retype[-1:]):
+                    retype = retype[:-1]
+                keys = [(_JAMO_TO_KEY[j], j in _SHIFTED_JAMO)
+                        for c in tail_raw[len(retype):]
+                        for j in split_jamo(_MODERN_TO_COMPAT.get(c, c))]
+                self._blocked_keys[:0] = letter_key_events(keys)
             self.buffer = self.buffer[:self._pending_len]
             self.composed = compose_hangul(self.buffer)
-            extra = compose_hangul(tail_raw) + append
-            self._composing_hint = composing
+            extra = compose_hangul(retype) + append
+            self._confirm_hint = (tail_raw, append, composing)
             self._fire_special(p_trig, p_out, p_via, k=k, extra=extra)
             return
 
-        if append == "\n":
+        if append in (KEY_ENTER, KEY_SHIFT_ENTER):
             # 엔터로 확정 → 인자 없이 즉시 종료(종료자 엔터는 화면에서 삭제).
             self._begin_capture(p_trig, p_out, p_via, k, self._pending_len)
             self._finalize_capture()
@@ -1781,12 +2068,17 @@ class KeyboardListener(QObject):
             self._finalize_capture()
             return
         if key == Key.backspace:
-            self.buffer = self.buffer[:-1]
-            self.composed = compose_hangul(self.buffer)
             # 트리거 이전(인자 시작 위치보다 앞)까지 지우면 캡처 취소.
-            if len(self.buffer) < cap["start_len"]:
+            into_trigger = self._erases_into(cap["start_len"])
+            self._erase_last()
+            if into_trigger:
                 dbg("CAPTURE cancel (backspaced past trigger)")
                 self._cancel_capture()
+            return
+        if self._is_passive_key(key):
+            # 인자 안의 된소리(Shift)·한/영 전환은 취소 사유가 아니다.
+            if self._key_vk(key) in self._COMMIT_VKS:
+                self._commit_composition()
             return
         # 그 외 특수키는 캡처를 취소한다(입력 하이재킹 방지 안전장치).
         dbg(f"CAPTURE cancel (special key {key!r})")
@@ -1854,7 +2146,7 @@ class KeyboardListener(QObject):
         # 재귀/중첩 호출 방어: 이전 치환의 입력 주입이 아직 진행 중이면 무시
         if self._replacing:
             dbg(f"REPLACE skipped (busy) trig={trigger!r}")
-            self._composing_hint = None
+            self._confirm_hint = None
             return
         self._replacing = True
 
@@ -1882,14 +2174,14 @@ class KeyboardListener(QObject):
         #  bs 3개가 ";;" 와 공백을 지워 "안녕.결과" 가 됨)
         # 그래서 주입 스레드가 백스페이스 전에 조합을 확정시키도록 알려 준다.
         composing = is_jamo(self.buffer[-1:]) if consumed_raw else False
-        # extra 가 스페이스/엔터면 그 키가 이미 조합을 확정시켰다.
-        if extra and extra[-1] in " \n":
+        # 스페이스/엔터(인자 종료 Enter 포함)가 이미 조합을 확정시켰다.
+        if (extra + consume_extra)[-1:] in (" ", KEY_ENTER, KEY_SHIFT_ENTER):
             composing = False
-        # 보류 확정처럼 버퍼를 잘라서 넘긴 경우엔 호출자가 실제 화면 끝 기준으로
-        # 판단한 값을 쓴다.
-        hint, self._composing_hint = self._composing_hint, None
+        # 보류 확정은 버퍼를 잘라 넘기므로, 실제 화면 끝 기준 값을 쓴다.
+        tail_raw, typed_after = "", extra
+        hint, self._confirm_hint = self._confirm_hint, None
         if hint is not None:
-            composing = hint
+            tail_raw, typed_after, composing = hint
 
         # ── 화면(조합형) 기준으로 실제 지워야 할 글자 수를 정확히 계산 ──────
         # 트리거를 치기 '전' 화면(before)과 '후' 화면(after)을 비교한다.
@@ -1898,7 +2190,7 @@ class KeyboardListener(QObject):
         # 합쳐진 앞 글자까지 함께 지워진다(=문장 중간에서 단축어를 쓰면 앞의
         # 글자/띄어쓰기가 사라지던 버그). 그럴 땐 지운 뒤 그 앞 글자를 다시
         # 찍어(reinject) 복원한다. 병합이 없으면 reinject 는 "" 이라 종전과 동일.
-        after = self.composed  # == compose_hangul(self.buffer) (extra 미포함)
+        after = compose_hangul(self.buffer + tail_raw)  # 확정 키 미포함
         before = compose_hangul(self.buffer[:-consumed_raw]) if consumed_raw else after
         cp = 0
         m = min(len(before), len(after))
@@ -1914,7 +2206,7 @@ class KeyboardListener(QObject):
         # consume_extra(파라미터 규칙의 종료자 Enter 등)도 화면에 찍혀 있으므로
         # 백스페이스 대상이지만, to_type 에는 넣지 않아 다시 찍히지 않는다.
         # 즉 백스페이스 시점의 화면 = (트리거+병합 앞글자) + extra + consume_extra.
-        backspace_count = trigger_backspaces + len(extra) + len(consume_extra)
+        backspace_count = trigger_backspaces + len(typed_after) + len(consume_extra)
 
         # 실제 입력 주입(백스페이스+붙여넣기)에 걸릴 예상 시간을 계산해
         # 그동안의 키 이벤트는 무시(억제)한다.
@@ -1935,7 +2227,7 @@ class KeyboardListener(QObject):
         # 으로 맞춘다. before[:cp] + to_type == before + resolved + extra 이므로
         # 앞 문맥이 그대로 보존된다(종전엔 조합형에서 앞 문맥을 버려 버퍼가
         # 화면과 어긋났음).
-        self.buffer = before[:cp] + to_type
+        self.buffer = freeze_text(before[:cp] + _as_soft_breaks(to_type))
         self.composed = compose_hangul(self.buffer)
 
         dbg(f"REPLACE trig={trigger!r} via={via} cr={consumed_raw} "
@@ -1966,8 +2258,9 @@ class KeyboardListener(QObject):
             #    (b) Chromium 계열처럼 그 메시지를 무시하는 앱에서는 진짜
             #        한/영 키를 눌러 확정시킨다(끝나고 다시 눌러 원복).
             #
-            #    - 콘솔(스캔코드 주입): 출력이 한글로 바뀌지 않게 어차피 영문
-            #      모드가 필요하므로 (a) 를 쓰고, 안 먹으면 (b).
+            #    - 콘솔(스캔코드 주입): 출력이 한글로 바뀌지 않게 영문 모드가
+            #      필요하다. 한국어 IME 는 (b) 로 전환·복원하고((a) 는 복원이
+            #      실제로 먹지 않는다), 그 밖의 IME 만 (a) 를 쓴다.
             #    - 그 외 GUI(유니코드 주입): 영문 모드가 필요 없으므로 조합 중일
             #      때만 (b) 진짜 한/영 키로 확정한다. 예전엔 여기서도 (a) 를 먼저
             #      쓰고 '성공'하면 (b) 를 건너뛰었는데, Chromium(VSCode 등)은
@@ -1976,9 +2269,15 @@ class KeyboardListener(QObject):
             #      있었다. 한/영 키는 어떤 앱이든 IME 가 직접 처리하므로 확실하다.
             console = foreground_needs_scancode()
             if console:
-                saved_ime = ime_force_alphanumeric()
-                if composing and not saved_ime:
+                # 한국어 IME 는 반드시 진짜 한/영 키로 바꾼다. conhost·Windows
+                # Terminal 은 메시지로 되돌리면 "한글"이라고 답만 하고 실제로는
+                # 영문으로 남는다(실측). 메시지 방식은 그 밖의 IME 용 폴백.
+                if hangul_mode_active():
                     toggled = send_hangul_toggle()
+                else:
+                    saved_ime = ime_force_alphanumeric()
+                    if composing and not saved_ime:
+                        toggled = send_hangul_toggle()
             elif composing:
                 toggled = send_hangul_toggle()
             if saved_ime or toggled:
@@ -2024,7 +2323,7 @@ class KeyboardListener(QObject):
                 dbg(f"send_text ok={ok} case_guarantee={self.case_guarantee}")
                 if not ok:
                     # 폴백: 비-Windows이거나 주입 실패 시 pynput 타이핑
-                    self.controller.type(to_type)
+                    self._fallback_type(to_type)
                     dbg("fallback pynput type used")
             else:
                 # 유니코드 직접 주입 (IME 미경유 → 언어 보존·Chromium 호환)
@@ -2032,7 +2331,7 @@ class KeyboardListener(QObject):
                                force_unicode=True)
                 dbg(f"inject via=unicode ok={ok}")
                 if not ok:
-                    self.controller.type(to_type)
+                    self._fallback_type(to_type)
                     dbg("fallback pynput type used")
             time.sleep(self._POST_TYPE_DELAY)
             dbg(f"inject done trig={trigger!r}")
@@ -2043,12 +2342,28 @@ class KeyboardListener(QObject):
             ime_restore(saved_ime)
             if toggled:
                 send_hangul_toggle()
+            if saved_ime or toggled:
+                # 모드 복원 전에 되돌린 키를 영문으로 읽지 않도록.
+                time.sleep(0.03)
             self._replacing = False
             # 치환 중에 사용자가 친 키(뒤에 이어 친 띄어쓰기 등)를 돌려준다.
             try:
                 self._replay_blocked_keys()
             except Exception as e:
                 dbg(f"REPLAY error {e!r}")
+
+    def _fallback_type(self, text: str):
+        """pynput 폴백 타이핑(Enter 와 Shift+Enter 구분 유지)."""
+        for part in re.split(r"([\r\n])", text):
+            if part == KEY_SHIFT_ENTER:
+                self.controller.press(Key.shift)
+            if part in (KEY_ENTER, KEY_SHIFT_ENTER):
+                self.controller.press(Key.enter)
+                self.controller.release(Key.enter)
+            elif part:
+                self.controller.type(part)
+            if part == KEY_SHIFT_ENTER:
+                self.controller.release(Key.shift)
 
     # Windows 저수준 후크 플래그: 이 키 이벤트가 SendInput 등으로 "주입"된
     # 것임을 나타낸다. 우리 치환 주입(백스페이스·유니코드/스캔코드 텍스트)은
@@ -2077,6 +2392,7 @@ class KeyboardListener(QObject):
 
     # 후크가 알려주는 원본 이벤트 플래그/메시지
     _LLKHF_EXTENDED = 0x01
+    _WM_KEYDOWN_MSGS = (0x0100, 0x0104) # WM_KEYDOWN, WM_SYSKEYDOWN
     _WM_KEYUP_MSGS = (0x0101, 0x0105)   # WM_KEYUP, WM_SYSKEYUP
     _MAX_BLOCKED_KEYS = 64              # 폭주 방지 상한(키 32개 분량)
 
@@ -2162,6 +2478,10 @@ class KeyboardListener(QObject):
             # 이 키들을 순서대로 다시 보낸다.
             self._queue_blocked_key(msg, data)
             self._listener.suppress_event()
+        elif (msg in self._WM_KEYDOWN_MSGS
+              and getattr(data, "vkCode", None) == 0x0D):
+            # _on_press 는 조금 뒤에 돌므로, Shift 상태는 누른 순간에 읽어 둔다.
+            self._enter_shift = key_is_down(0x10)
         return True
 
     def start(self):
@@ -2194,19 +2514,26 @@ def _placeholder_help_html(variables: dict = None) -> str:
     variables = variables or {}
     if variables:
         var_rows = "".join(
-            f"<tr><td><code>{{{name}}}</code></td><td>{val}</td></tr>"
+            f"<tr><td><code>{{{html.escape(str(name))}}}</code></td>"
+            f"<td>{html.escape(str(val))}</td></tr>"
             for name, val in list(variables.items())[:12]
         )
         var_example = (
-            "<p>현재 등록된 변수 (설정 → 변수 관리에서 추가/수정):</p>"
+            f"<p>{tr('현재 등록된 변수 (설정 → 변수 관리에서 추가/수정):')}</p>"
             f"<table>{var_rows}</table>"
         )
     else:
-        var_example = (
-            "<p>아직 등록된 변수가 없습니다. <b>설정 → 변수 관리</b>에서 "
+        none_yet = tr(
+            "아직 등록된 변수가 없습니다. <b>설정 → 변수 관리</b>에서 "
             "<code>{회사}=한빛</code> 처럼 추가하면 출력에서 <code>{회사}</code> "
-            "로 재사용할 수 있습니다.</p>"
-        )
+            "로 재사용할 수 있습니다.")
+        var_example = f"<p>{none_yet}</p>"
+    args_intro = tr(
+        "<b>special(;단축어) 규칙</b>의 출력에 <code>{1}</code> <code>{2}</code> … "
+        "를 넣으면, 트리거를 친 뒤 <b>공백으로 인자를 이어 입력하고 Enter 로 확정</b>합니다.")
+    args_example = tr(
+        '예) 트리거 <code>;메일</code>, 출력 <code>{1} 님께</code> → '
+        '<span class="ex">;메일 홍길동⏎</span> 입력 시 <span class="ex">홍길동 님께</span>')
     return f"""
     <style>
       body {{ font-size: 13px; line-height: 1.5; }}
@@ -2217,50 +2544,73 @@ def _placeholder_help_html(variables: dict = None) -> str:
       td {{ padding:2px 12px 2px 0; }}
       .ex {{ color:#4ADE80; }}
     </style>
-    <h3>1. 날짜 · 시간</h3>
+    <h3>{tr("1. 날짜 · 시간")}</h3>
     <table>
-      <tr><td><code>{{date}}</code></td><td>오늘 날짜 → <span class="ex">2026-07-11</span></td></tr>
-      <tr><td><code>{{time}}</code></td><td>현재 시각 → <span class="ex">20:03:00</span></td></tr>
-      <tr><td><code>{{datetime}}</code></td><td>날짜+시각</td></tr>
-      <tr><td><code>{{date:%Y%m%d}}</code></td><td>형식 지정 → <span class="ex">20260711</span></td></tr>
+      <tr><td><code>{{date}}</code></td><td>{tr("오늘 날짜")} → <span class="ex">2026-07-11</span></td></tr>
+      <tr><td><code>{{time}}</code></td><td>{tr("현재 시각")} → <span class="ex">20:03:00</span></td></tr>
+      <tr><td><code>{{datetime}}</code></td><td>{tr("날짜+시각")}</td></tr>
+      <tr><td><code>{{date:%Y%m%d}}</code></td><td>{tr("형식 지정")} → <span class="ex">20260711</span></td></tr>
       <tr><td><code>{{date:%m-%d}}</code></td><td>→ <span class="ex">07-11</span></td></tr>
     </table>
 
-    <h3>2. 호출 시 인자 (위치 인자)</h3>
-    <p><b>special(;단축어) 규칙</b>의 출력에 <code>{{1}}</code> <code>{{2}}</code> …
-    를 넣으면, 트리거를 친 뒤 <b>공백으로 인자를 이어 입력하고 Enter 로 확정</b>합니다.</p>
+    <h3>{tr("2. 호출 시 인자 (위치 인자)")}</h3>
+    <p>{args_intro}</p>
     <table>
-      <tr><td><code>{{1}}</code> <code>{{2}}</code></td><td>공백으로 구분한 1·2번째 인자</td></tr>
-      <tr><td><code>{{*}}</code></td><td>인자 전체(내부 공백 보존)</td></tr>
-      <tr><td><code>{{1:기본값}}</code></td><td>그 인자가 없을 때 쓸 기본값</td></tr>
+      <tr><td><code>{{1}}</code> <code>{{2}}</code></td><td>{tr("공백으로 구분한 1·2번째 인자")}</td></tr>
+      <tr><td><code>{{*}}</code></td><td>{tr("인자 전체(내부 공백 보존)")}</td></tr>
+      <tr><td><code>{tr("{1:기본값}")}</code></td><td>{tr("그 인자가 없을 때 쓸 기본값")}</td></tr>
     </table>
-    <p>예) 트리거 <code>;메일</code>, 출력 <code>{{1}} 님께</code> →
-    <span class="ex">;메일 홍길동⏎</span> 입력 시 <span class="ex">홍길동 님께</span></p>
+    <p>{args_example}</p>
 
-    <h3>3. 재사용 변수</h3>
+    <h3>{tr("3. 재사용 변수")}</h3>
     <table>
-      <tr><td><code>{{이름}}</code></td><td>미리 정의한 값으로 치환</td></tr>
+      <tr><td><code>{tr("{이름}")}</code></td><td>{tr("미리 정의한 값으로 치환")}</td></tr>
     </table>
     {var_example}
 
-    <h3>4. 리터럴 중괄호</h3>
-    <p><code>{{{{</code> → <code>{{</code>,&nbsp; <code>}}}}</code> → <code>}}</code>
-    (중괄호 자체를 그대로 출력하고 싶을 때)</p>
+    <h3>{tr("4. 줄바꿈")}</h3>
+    <table>
+      <tr><td>{tr("일반 줄바꿈")}</td><td>{tr("Shift+Enter 로 입력 (기본 — 메신저에서 전송되지 않음)")}</td></tr>
+      <tr><td><code>{{enter}}</code></td><td>{tr("Enter 로 입력 (전송·실행). 바로 뒤 줄바꿈 1개는 같은 Enter 로 처리")}</td></tr>
+    </table>
 
-    <h3>참고</h3>
+    <h3>{tr("5. 리터럴 중괄호")}</h3>
+    <p><code>{{{{</code> → <code>{{</code>,&nbsp; <code>}}}}</code> → <code>}}</code>
+    ({tr("중괄호 자체를 그대로 출력하고 싶을 때")})</p>
+
+    <h3>{tr("참고")}</h3>
     <ul>
-      <li>인자 입력(위 2번)은 <b>special 트리거</b>에서만 동작합니다(word/regex 제외).</li>
-      <li>인자에는 한글도 그대로 쓸 수 있습니다(화면에 보이는 그대로 삽입).</li>
-      <li>Enter 는 인자 입력을 끝내는 <b>종료키</b>이므로, 출력에 줄바꿈을
-          넣으려면 출력 편집 칸에서 직접 Enter 로 줄을 나누세요.</li>
+      <li>{tr("인자 입력(위 2번)은 <b>special 트리거</b>에서만 동작합니다(word/regex 제외).")}</li>
+      <li>{tr("인자에는 한글도 그대로 쓸 수 있습니다(화면에 보이는 그대로 삽입).")}</li>
     </ul>
     """
 
 
+def _patch_notes_html() -> str:
+    parts = [f'<p><b>{tr("현재 버전: v{version}", version=APP_VERSION)}</b></p>']
+    for version, date, notes in CHANGELOG:
+        items = "".join(f"<li>{html.escape(item)}</li>"
+                        for item in notes[i18n.language()])
+        parts.append(f'<h3 style="color:#9370DB">v{version} '
+                     f'<span style="color:#888; font-size:11px">{date}</span></h3>'
+                     f"<ul>{items}</ul>")
+    return "".join(parts)
+
+
+def show_patch_notes(parent=None):
+    """버전별 패치 내역 창."""
+    _show_html_dialog(parent, tr("KeyFlux 패치 내역"), _patch_notes_html())
+
+
 def show_placeholder_help(parent=None, variables: dict = None):
     """플레이스홀더 문법 도움말 창을 띄운다(스크롤 가능한 읽기 전용)."""
+    _show_html_dialog(parent, tr("출력 문법 도움말"),
+                      _placeholder_help_html(variables))
+
+
+def _show_html_dialog(parent, title: str, body: str):
     dlg = QDialog(parent)
-    dlg.setWindowTitle("출력 문법 도움말")
+    dlg.setWindowTitle(title)
     dlg.setWindowIcon(make_app_icon())
     dlg.setMinimumSize(480, 560)
     if parent:
@@ -2273,7 +2623,7 @@ def show_placeholder_help(parent=None, variables: dict = None):
     browser.setStyleSheet(
         "QTextBrowser { background:#0F1117; color:#E8E8F0; border:1px solid "
         "#252840; border-radius:8px; padding:8px; }")
-    browser.setHtml(_placeholder_help_html(variables))
+    browser.setHtml(body)
     lay.addWidget(browser)
     btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
     btns.rejected.connect(dlg.accept)
@@ -2282,13 +2632,39 @@ def show_placeholder_help(parent=None, variables: dict = None):
     dlg.exec()
 
 
+# ── 출력 편집 칸 ─────────────────────────────────────────────────
+class OutputEdit(QPlainTextEdit):
+    """줄바꿈을 Shift+Enter 와 Enter 로 구분해 담는 출력 칸.
+    - Enter       : 선택된 줄바꿈 키(기본 Shift+Enter)
+    - Shift+Enter : 항상 Shift+Enter
+    Shift+Enter 는 일반 줄바꿈, Enter 는 "{enter}" + 줄바꿈으로 저장한다."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.plain_enter = False
+
+    def keyPressEvent(self, event):
+        mods = event.modifiers()
+        other = (Qt.KeyboardModifier.ControlModifier
+                 | Qt.KeyboardModifier.AltModifier)
+        if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and not mods & other):
+            shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+            enter = self.plain_enter and not shift
+            self.insertPlainText(ENTER_TOKEN + "\n" if enter else "\n")
+            self.ensureCursorVisible()
+            return
+        super().keyPressEvent(event)
+
+
 # ── 규칙 추가/편집 다이얼로그 ────────────────────────────────────
 class RuleDialog(QDialog):
     def __init__(self, parent=None, rule=None, variables=None,
                  groups=None, default_group=""):
         super().__init__(parent)
-        self.setWindowTitle("규칙 편집" if rule else "규칙 추가")
-        self.setFixedSize(440, 510)
+        self.setWindowTitle(tr("규칙 편집") if rule else tr("규칙 추가"))
+        self.setFixedWidth(500)
+        self._groups = list(groups or [])
         self.setStyleSheet(parent.styleSheet() if parent else "")
         # 미리보기에서 {이름} 을 실제 값으로 보여주기 위한 현재 변수 사전.
         self._variables = dict(variables or {})
@@ -2298,17 +2674,16 @@ class RuleDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
 
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["special (;단축어)", "word (단어)", "regex (정규식)"])
+        self.type_combo.addItems([tr("special (;단축어)"), tr("word (단어)"), tr("regex (정규식)")])
         self.trigger_edit = QLineEdit()
-        self.trigger_edit.setPlaceholderText("예: abc  또는  ;date  또는  \\d{4}")
+        self.trigger_edit.setPlaceholderText(tr("예: abc  또는  ;date  또는  \\d{4}"))
         # 출력은 여러 줄(줄바꿈 포함)을 담을 수 있도록 다중 줄 입력을 쓴다.
-        # Enter 를 누르면 줄바꿈이 들어가고, 저장된 줄바꿈은 치환 시 실제
-        # Enter 키로 주입된다(send_text 의 "\n" 처리). 저장은 "저장" 버튼
+        # 줄바꿈은 Shift+Enter, "{enter}" 는 Enter 로 주입된다. 저장은 "저장" 버튼
         # 또는 Ctrl+Enter 로 한다(아래 단축키 참조).
-        self.output_edit = QPlainTextEdit()
+        self.output_edit = OutputEdit()
         self.output_edit.setPlaceholderText(
-            "예: 123  또는  {date}  또는  [DATE]\n(Enter 로 줄바꿈, Ctrl+Enter 로 저장)")
-        self.output_edit.setFixedHeight(90)
+            tr("예: 123  또는  {date}  또는  [DATE]\n(Ctrl+Enter 로 저장)"))
+        self.output_edit.setFixedHeight(110)
         # Tab 은 필드 이동(다음 위젯)으로 쓰이도록 탭 입력을 막지 않되,
         # 여러 줄 편집기의 기본 Tab(탭 문자 삽입)을 유지한다.
         self.output_edit.setTabChangesFocus(True)
@@ -2316,18 +2691,26 @@ class RuleDialog(QDialog):
         # 그룹: 기존 그룹에서 고르거나 새 이름을 직접 입력(자동으로 그룹 생성).
         self.group_combo = QComboBox()
         self.group_combo.setEditable(True)
-        self.group_combo.addItem("(미분류)")
+        self.group_combo.addItem(tr("(미분류)"))
         for g in (groups or []):
             self.group_combo.addItem(g)
         self.group_combo.setToolTip(
-            "키워드를 묶을 그룹. 목록에서 고르거나 새 이름을 입력하면 그룹이 "
-            "만들어집니다. 그룹 단위로 켜고 끌 수 있습니다.")
+            tr("키워드를 묶을 그룹. 목록에서 고르거나 새 이름을 입력하면 그룹이 "
+            "만들어집니다. 그룹 단위로 켜고 끌 수 있습니다."))
         self._set_group_text(default_group)
 
-        layout.addRow("타입",   self.type_combo)
-        layout.addRow("그룹",   self.group_combo)
-        layout.addRow("트리거", self.trigger_edit)
-        layout.addRow("출력",   self.output_edit)
+        layout.addRow(tr("타입"),   self.type_combo)
+        layout.addRow(tr("그룹"),   self.group_combo)
+        layout.addRow(tr("트리거"), self.trigger_edit)
+        layout.addRow(tr("출력"),   self.output_edit)
+
+        self.break_combo = QComboBox()
+        self.break_combo.addItems([tr("Shift+Enter (기본)"), tr("Enter (전송·실행)")])
+        self.break_combo.setToolTip(
+            tr("출력 칸에서 Enter 를 누를 때 넣을 키입니다. "
+            "Enter 로 저장한 줄바꿈은 {enter} 로 표시됩니다."))
+        self.break_combo.currentIndexChanged.connect(self._on_break_changed)
+        layout.addRow(tr("줄바꿈 키"), self.break_combo)
 
         # ── 실시간 미리보기 ──────────────────────────────────────
         # 출력 필드에 {date:%Y%m%d} 같은 형식을 입력하면, 실제
@@ -2340,7 +2723,7 @@ class RuleDialog(QDialog):
             "border-radius: 6px; padding: 6px 10px;"
         )
         self.preview_label.setWordWrap(True)
-        layout.addRow("미리보기", self.preview_label)
+        layout.addRow(tr("미리보기"), self.preview_label)
 
         # 파라미터({1}/{*}) 규칙임을 알려주는 배지(해당할 때만 보임).
         self.param_badge = QLabel()
@@ -2363,30 +2746,31 @@ class RuleDialog(QDialog):
         save_sc2.activated.connect(self.accept)
 
         hint = QLabel(
-            "{date} {time} {datetime} · {1} {2} {*}(인자) · {이름}(변수)\n"
+            tr("{date} {time} {datetime} · {1} {2} {*}(인자) · {이름}(변수)\n"
             "형식 지정: {date:%Y%m%d} → 20260711   {time:%H:%M} → 20:03\n"
-            "자세한 문법은 아래 '문법 도움말' 참고 · Ctrl+Enter 로 저장"
+            "줄바꿈 = Shift+Enter · {enter} = Enter\n"
+            "자세한 문법은 아래 '문법 도움말' 참고 · Ctrl+Enter 로 저장")
         )
         hint.setStyleSheet("color: #888; font-size: 11px;")
         layout.addRow("", hint)
 
         btn_row = QHBoxLayout()
-        help_btn = QPushButton("? 문법 도움말")
+        help_btn = QPushButton(tr("? 문법 도움말"))
         help_btn.setObjectName("secondary")
         help_btn.setAutoDefault(False)
-        help_btn.setToolTip("출력에 쓸 수 있는 모든 문법을 봅니다")
+        help_btn.setToolTip(tr("출력에 쓸 수 있는 모든 문법을 봅니다"))
         help_btn.clicked.connect(
             lambda: show_placeholder_help(self, self._variables))
         btn_row.addWidget(help_btn)
         btn_row.addStretch()
-        ok_btn     = QPushButton("저장")
+        ok_btn     = QPushButton(tr("저장"))
         ok_btn.clicked.connect(self.accept)
         # 트리거(QLineEdit)에 포커스가 있을 때 Enter 로 저장되도록 "저장"
         # 버튼을 기본 버튼으로 지정. (출력 필드는 다중 줄이라 Enter 가
         # 줄바꿈으로 들어가므로, 출력 편집 중에는 Ctrl+Enter 로 저장한다.)
         ok_btn.setDefault(True)
         ok_btn.setAutoDefault(True)
-        cancel_btn = QPushButton("취소")
+        cancel_btn = QPushButton(tr("취소"))
         cancel_btn.setObjectName("secondary")
         cancel_btn.setAutoDefault(False)
         cancel_btn.clicked.connect(self.reject)
@@ -2402,16 +2786,20 @@ class RuleDialog(QDialog):
             self._set_group_text(rule_group(rule))
             self._update_preview()
 
+    def _on_break_changed(self, index):
+        self.output_edit.plain_enter = index == 1
+        self.output_edit.setFocus()
+
     def _set_group_text(self, name: str):
         name = (name or "").strip()
-        self.group_combo.setCurrentText(name if name else "(미분류)")
+        self.group_combo.setCurrentText(name if name else tr("(미분류)"))
 
     def get_group(self) -> str:
         g = self.group_combo.currentText().strip()
-        return "" if g in ("", "(미분류)", UNGROUPED_LABEL) else g
-
-    # 미리보기에서 위치 인자({1},{2}…)를 채울 샘플 값.
-    _SAMPLE_ARGS = ["인자1", "인자2", "인자3"]
+        if g in self._groups:
+            return g  # 다른 언어의 예약 표기와 이름이 같은 기존 그룹
+        return "" if g in (i18n.translations("(미분류)")
+                           | i18n.translations("미분류")) else g
 
     def _update_preview(self):
         text = self.output_edit.toPlainText()
@@ -2420,10 +2808,10 @@ class RuleDialog(QDialog):
         self.param_badge.setVisible(is_param)
         if is_param:
             self.param_badge.setText(
-                "이 규칙은 호출 시 인자를 받습니다 — 트리거 뒤에 공백으로 "
-                "인자를 입력하고 Enter 로 확정하세요. (아래는 샘플 인자 예시)")
+                tr("이 규칙은 호출 시 인자를 받습니다 — 트리거 뒤에 공백으로 "
+                "인자를 입력하고 Enter 로 확정하세요. (아래는 샘플 인자 예시)"))
         if not text:
-            self.preview_label.setText("(출력 내용을 입력하세요)")
+            self.preview_label.setText(tr("(출력 내용을 입력하세요)"))
             self.preview_label.setStyleSheet(
                 "color: #666; font-size: 12px; "
                 "background: #141620; border: 1px solid #252840; "
@@ -2431,17 +2819,20 @@ class RuleDialog(QDialog):
             )
             return
         try:
+            samples = [tr("인자{n}", n=n) for n in (1, 2, 3)]
             preview = resolve_output(
-                text, args=self._SAMPLE_ARGS, variables=self._variables,
-                args_all=" ".join(self._SAMPLE_ARGS))
-            self.preview_label.setText(f"→ {preview}")
+                text, args=samples, variables=self._variables,
+                args_all=" ".join(samples))
+            shown = (preview.replace(KEY_SHIFT_ENTER, " ⇧↵\n")
+                     .replace(KEY_ENTER, " ↵ Enter\n"))
+            self.preview_label.setText(f"→ {shown}")
             self.preview_label.setStyleSheet(
                 "color: #4ADE80; font-size: 12px; font-weight: 600; "
                 "background: #141620; border: 1px solid #252840; "
                 "border-radius: 6px; padding: 6px 10px;"
             )
         except Exception as e:
-            self.preview_label.setText(f"형식 오류: {e}")
+            self.preview_label.setText(tr("형식 오류: {error}", error=e))
             self.preview_label.setStyleSheet(
                 "color: #F87171; font-size: 12px; font-weight: 600; "
                 "background: #141620; border: 1px solid #5A2A2A; "
@@ -2469,7 +2860,7 @@ class VariableDialog(QDialog):
     def __init__(self, parent=None, name="", value="", existing=None,
                  edit_name=None):
         super().__init__(parent)
-        self.setWindowTitle("변수 편집" if edit_name else "변수 추가")
+        self.setWindowTitle(tr("변수 편집") if edit_name else tr("변수 추가"))
         self.setFixedWidth(360)
         self.setStyleSheet(parent.styleSheet() if parent else "")
         self._existing = set(existing or [])
@@ -2480,13 +2871,13 @@ class VariableDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 16)
 
         self.name_edit = QLineEdit(name)
-        self.name_edit.setPlaceholderText("예: 회사  (출력에서 {회사} 로 사용)")
+        self.name_edit.setPlaceholderText(tr("예: 회사  (출력에서 {회사} 로 사용)"))
         self.value_edit = QLineEdit(value)
-        self.value_edit.setPlaceholderText("예: 한빛")
-        layout.addRow("이름", self.name_edit)
-        layout.addRow("값", self.value_edit)
+        self.value_edit.setPlaceholderText(tr("예: 한빛"))
+        layout.addRow(tr("이름"), self.name_edit)
+        layout.addRow(tr("값"), self.value_edit)
 
-        hint = QLabel("이름에 { } : 기호·순수 숫자·* 는 쓸 수 없습니다.")
+        hint = QLabel(tr("이름에 { } : 기호·순수 숫자·* 는 쓸 수 없습니다."))
         hint.setStyleSheet("color:#888; font-size:11px;")
         hint.setWordWrap(True)
         layout.addRow("", hint)
@@ -2502,11 +2893,11 @@ class VariableDialog(QDialog):
         name = self.name_edit.text().strip()
         err = validate_variable_name(name)
         if err:
-            QMessageBox.warning(self, "변수명 오류", err)
+            QMessageBox.warning(self, tr("변수명 오류"), err)
             return
         # 편집 중인 자기 자신을 제외하고 중복 이름 검사.
         if name != self._edit_name and name in self._existing:
-            QMessageBox.warning(self, "중복", f"'{name}' 변수가 이미 있습니다.")
+            QMessageBox.warning(self, tr("중복"), tr("'{name}' 변수가 이미 있습니다.", name=name))
             return
         self.accept()
 
@@ -2591,17 +2982,37 @@ def make_app_icon() -> QIcon:
     return icon
 
 
+# ── 표시 언어 ────────────────────────────────────────────────────
+_qt_translator = None
+
+
+def apply_language(setting) -> str:
+    """앱 문구와 Qt 기본 버튼(예/아니요/닫기 등)의 언어를 함께 바꾼다."""
+    global _qt_translator
+    code = i18n.resolve_language(setting, QLocale.system().uiLanguages())
+    i18n.set_language(code)
+    app = QApplication.instance()
+    if app is not None:
+        if _qt_translator is not None:
+            app.removeTranslator(_qt_translator)
+        _qt_translator = QTranslator()
+        name = "qtbase_" + ("zh_CN" if code == "zh" else code)
+        folder = QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
+        if _qt_translator.load(name, folder):
+            app.installTranslator(_qt_translator)
+    return code
+
+
 # ── 메인 윈도우 ──────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        # 관리자 권한 실행 여부를 제목에 표시(관리자 앱 대응 동작 확인용)
-        self.setWindowTitle(
-            f"KeyFlux v{APP_VERSION}" + (" (관리자)" if is_elevated() else ""))
         self.setMinimumSize(860, 560)
         self.setWindowIcon(make_app_icon())  # 창/작업표시줄 아이콘
         self.rules = load_rules()
         self.settings = load_settings()
+        apply_language(self.settings.get("language"))
+        self._set_title()
         self.variables = load_variables()
         # 키워드 그룹 상태: 표시 순서(빈 그룹 포함) / 꺼진 그룹 / 현재 필터.
         # group_filter: None = 전체 보기, "" = 미분류, 그 외 = 그룹 이름.
@@ -2621,16 +3032,52 @@ class MainWindow(QMainWindow):
         self._build_tray()
         self._connect_listener_signals()
 
+    def _set_title(self):
+        # 관리자 권한 실행 여부를 제목에 표시(관리자 앱 대응 동작 확인용)
+        self.setWindowTitle(
+            f"KeyFlux v{APP_VERSION}" + (tr(" (관리자)") if is_elevated() else ""))
+
+    # ── 언어 전환 ────────────────────────────────────────────────
+    def _on_language_selected(self, index):
+        code = self.lang_combo.itemData(index)
+        if code == self.settings.get("language", "auto"):
+            return
+        self.settings["language"] = code
+        save_settings(self.settings)
+        # 콤보가 든 설정 창을 다시 만들므로 시그널 처리가 끝난 뒤에 바꾼다.
+        QTimer.singleShot(0, self._retranslate)
+
+    def _retranslate(self):
+        """재시작 없이 화면 전체를 현재 언어로 다시 만든다."""
+        apply_language(self.settings.get("language"))
+        reopen = False
+        old = self._settings_dialog
+        if old is not None:
+            reopen = old.isVisible()
+            old.hide()
+            old.deleteLater()
+            self._settings_dialog = None
+        self._set_title()
+        self._build_ui()
+        self._show_active_state()
+        self._fill_tray()
+        if reopen:
+            self._open_settings()
+
     # ── 스타일 ───────────────────────────────────────────────────
     def _apply_style(self):
         self.setStyleSheet("""
             QMainWindow, QDialog { background: #0F1117; }
             QWidget { background: #0F1117; color: #E8E8F0;
-                      font-family: 'Segoe UI', 'Apple SD Gothic Neo', sans-serif;
+                      font-family: 'Segoe UI', 'Malgun Gothic', 'Yu Gothic UI',
+                                   'Microsoft YaHei UI', 'Apple SD Gothic Neo', sans-serif;
                       font-size: 13px; }
 
             QLabel#title    { font-size: 22px; font-weight: 700; color: #FFFFFF; letter-spacing: 1px; }
-            QLabel#version  { font-size: 12px; font-weight: 700; color: #9370DB; }
+            QPushButton#version {
+                background: transparent; color: #9370DB; padding: 2px 4px;
+                border: none; font-size: 12px; font-weight: 700; }
+            QPushButton#version:hover { color: #B79CF0; text-decoration: underline; }
             QLabel#subtitle { font-size: 12px; color: #666; }
             QLabel#status_label { font-size: 12px; color: #888; }
 
@@ -2740,18 +3187,21 @@ class MainWindow(QMainWindow):
         title_row.setSpacing(8)
         t = QLabel("KeyFlux")
         t.setObjectName("title")
-        ver = QLabel(f"v{APP_VERSION}")
+        self.version_btn = ver = QPushButton(
+            tr("v{version} · 패치 내역", version=APP_VERSION))
         ver.setObjectName("version")
-        ver.setToolTip(f"KeyFlux 버전 {APP_VERSION}")
+        ver.setCursor(Qt.CursorShape.PointingHandCursor)
+        ver.setToolTip(tr("버전별 변경 사항을 봅니다"))
+        ver.clicked.connect(lambda: show_patch_notes(self))
         title_row.addWidget(t)
         title_row.addWidget(ver, alignment=Qt.AlignmentFlag.AlignBottom)
         title_row.addStretch()
-        sub = QLabel("키 입력 자동 변환 · 백그라운드 실행")
+        sub = QLabel(tr("키 입력 자동 변환 · 백그라운드 실행"))
         sub.setObjectName("subtitle")
         title_col.addLayout(title_row)
         title_col.addWidget(sub)
 
-        self.toggle_btn = QPushButton("● 활성화됨")
+        self.toggle_btn = QPushButton(tr("● 활성화됨"))
         self.toggle_btn.setObjectName("toggle_on")
         self.toggle_btn.clicked.connect(self._toggle_active)
 
@@ -2771,14 +3221,14 @@ class MainWindow(QMainWindow):
         toolbar = QHBoxLayout()
         toolbar.setSpacing(6)
 
-        add_btn = QPushButton("+ 규칙 추가")
+        add_btn = QPushButton(tr("+ 규칙 추가"))
         add_btn.clicked.connect(self._add_rule)
 
-        edit_btn = QPushButton("편집")
+        edit_btn = QPushButton(tr("편집"))
         edit_btn.setObjectName("secondary")
         edit_btn.clicked.connect(self._edit_rule)
 
-        del_btn = QPushButton("삭제")
+        del_btn = QPushButton(tr("삭제"))
         del_btn.setObjectName("danger")
         del_btn.clicked.connect(self._delete_rule)
 
@@ -2787,14 +3237,14 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet("color: #252840;")
         sep.setFixedWidth(1)
 
-        export_btn = QPushButton("↑ 내보내기")
+        export_btn = QPushButton(tr("↑ 내보내기"))
         export_btn.setObjectName("secondary")
-        export_btn.setToolTip("현재 규칙을 JSON 파일로 저장합니다")
+        export_btn.setToolTip(tr("현재 규칙을 JSON 파일로 저장합니다"))
         export_btn.clicked.connect(self._export_rules)
 
-        import_btn = QPushButton("↓ 불러오기")
+        import_btn = QPushButton(tr("↓ 불러오기"))
         import_btn.setObjectName("secondary")
-        import_btn.setToolTip("JSON 파일에서 규칙을 불러옵니다")
+        import_btn.setToolTip(tr("JSON 파일에서 규칙을 불러옵니다"))
         import_btn.clicked.connect(self._import_rules)
 
         # 동작 옵션(한/영 무관·대소문자·알림·자동실행·디버그)은 별도 설정
@@ -2802,9 +3252,9 @@ class MainWindow(QMainWindow):
         # self.*_chk 를 참조하므로) 설정 창이 레이아웃에 배치한다.
         self._create_option_widgets()
 
-        settings_btn = QPushButton("⚙ 설정")
+        settings_btn = QPushButton(tr("⚙ 설정"))
         settings_btn.setObjectName("secondary")
-        settings_btn.setToolTip("동작 옵션을 설정 창에서 조작합니다")
+        settings_btn.setToolTip(tr("동작 옵션을 설정 창에서 조작합니다"))
         settings_btn.clicked.connect(self._open_settings)
 
         toolbar.addWidget(add_btn)
@@ -2824,7 +3274,7 @@ class MainWindow(QMainWindow):
         # 테이블
         self.table = RulesTable()
         self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["활성", "타입", "그룹", "트리거", "출력"])
+        self.table.setHorizontalHeaderLabels([tr("활성"), tr("타입"), tr("그룹"), tr("트리거"), tr("출력")])
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(0, 48)
@@ -2865,10 +3315,10 @@ class MainWindow(QMainWindow):
 
         # 상태바
         status_row = QHBoxLayout()
-        self.status_label = QLabel("대기 중...")
+        self.status_label = QLabel(tr("대기 중..."))
         self.status_label.setObjectName("status_label")
 
-        self.config_path_label = QLabel(f"설정 파일: {DATA_FILE}")
+        self.config_path_label = QLabel(tr("설정 파일: {path}", path=DATA_FILE))
         self.config_path_label.setObjectName("status_label")
         self.config_path_label.setToolTip(str(DATA_FILE))
 
@@ -2885,48 +3335,48 @@ class MainWindow(QMainWindow):
         """동작 옵션 체크박스들을 생성한다(레이아웃 배치는 설정 창에서).
         토글 핸들러들이 self.*_chk 를 참조하므로 위젯은 메인윈도우가 소유한다."""
         # 한/영·대소문자 무관 매칭 (기본 켜짐)
-        self.normalize_chk = QCheckBox("한/영·대소문자 무관 매칭")
+        self.normalize_chk = QCheckBox(tr("한/영·대소문자 무관 매칭"))
         self.normalize_chk.setChecked(
             bool(self.settings.get("normalize_mode", True)))
         self.normalize_chk.setToolTip(
-            "켜면 한/영 입력 상태나 대소문자와 상관없이 트리거가 동작합니다.\n"
-            "(예: 영문 모드든 한글 모드든 같은 키를 누르면 변환)")
+            tr("켜면 한/영 입력 상태나 대소문자와 상관없이 트리거가 동작합니다.\n"
+            "(예: 영문 모드든 한글 모드든 같은 키를 누르면 변환)"))
         self.normalize_chk.stateChanged.connect(self._toggle_normalize)
 
         # 결과 대소문자 보장 (기본 켜짐)
-        self.case_chk = QCheckBox("결과 대소문자 보장")
+        self.case_chk = QCheckBox(tr("결과 대소문자 보장"))
         self.case_chk.setChecked(
             bool(self.settings.get("output_case_guarantee", True)))
         self.case_chk.setToolTip(
-            "켜면 CapsLock 이 켜져 있어도 출력 결과의 대소문자가\n"
+            tr("켜면 CapsLock 이 켜져 있어도 출력 결과의 대소문자가\n"
             "저장한 그대로 들어갑니다. 끄면 CapsLock 상태에 따라\n"
-            "대소문자가 뒤집힐 수 있습니다.")
+            "대소문자가 뒤집힐 수 있습니다."))
         self.case_chk.stateChanged.connect(self._toggle_case_guarantee)
 
         # 윈도우 알림(트레이 풍선) 표시 (기본 켜짐)
-        self.notify_chk = QCheckBox("알림 표시")
+        self.notify_chk = QCheckBox(tr("알림 표시"))
         self.notify_chk.setChecked(
             bool(self.settings.get("notifications_enabled", True)))
         self.notify_chk.setToolTip(
-            "켜면 변환 결과와 트레이 안내를 윈도우 알림(풍선)으로 표시합니다.")
+            tr("켜면 변환 결과와 트레이 안내를 윈도우 알림(풍선)으로 표시합니다."))
         self.notify_chk.stateChanged.connect(self._toggle_notifications)
 
         # 시작 시 자동 실행 (Windows 시작 프로그램 등록)
-        self.startup_chk = QCheckBox("시작 시 자동 실행")
+        self.startup_chk = QCheckBox(tr("시작 시 자동 실행"))
         self.startup_chk.setChecked(is_startup_enabled())
         self.startup_chk.setEnabled(sys.platform == "win32")
         self.startup_chk.setToolTip(
-            "켜면 Windows 로그인 시 KeyFlux 가 자동으로 실행됩니다. "
+            tr("켜면 Windows 로그인 시 KeyFlux 가 자동으로 실행됩니다. "
             "작업 스케줄러에 등록되며(관리자 권한·UAC 창 없음), 배터리로 켜도 "
-            "실행됩니다. 등록이 사라지면 다음 실행 때 자동으로 복구합니다.")
+            "실행됩니다. 등록이 사라지면 다음 실행 때 자동으로 복구합니다."))
         self.startup_chk.stateChanged.connect(self._toggle_startup)
 
         # 디버그 로그 (진단용)
-        self.debug_chk = QCheckBox("디버그 로그")
+        self.debug_chk = QCheckBox(tr("디버그 로그"))
         self.debug_chk.setChecked(bool(self.settings.get("debug_log", False)))
         self.debug_chk.setToolTip(
-            "켜면 키 감지·치환·주입 과정을 파일로 기록합니다.\n"
-            f"기록 위치: {DEBUG_LOG_FILE}")
+            tr("켜면 키 감지·치환·주입 과정을 파일로 기록합니다.\n"
+               "기록 위치: {path}", path=DEBUG_LOG_FILE))
         self.debug_chk.stateChanged.connect(self._toggle_debug)
 
         # 설정 창은 최초 열 때 한 번만 만들어 재사용한다.
@@ -2934,7 +3384,7 @@ class MainWindow(QMainWindow):
 
     def _build_settings_dialog(self) -> QDialog:
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"KeyFlux 설정 (v{APP_VERSION})")
+        dlg.setWindowTitle(tr("KeyFlux 설정 (v{version})", version=APP_VERSION))
         dlg.setWindowIcon(make_app_icon())
         dlg.setMinimumWidth(420)
         lay = QVBoxLayout(dlg)
@@ -2942,27 +3392,43 @@ class MainWindow(QMainWindow):
         lay.setSpacing(14)
 
         # 버전 정보 (앱 내부에서 현재 버전 확인 가능)
+        top = QHBoxLayout()
         ver_label = QLabel(f"KeyFlux v{APP_VERSION}")
         ver_label.setStyleSheet("color: #9370DB; font-weight: 700; font-size: 13px;")
-        lay.addWidget(ver_label)
+        top.addWidget(ver_label)
+        notes_btn = QPushButton(tr("패치 내역"))
+        notes_btn.setObjectName("secondary")
+        notes_btn.clicked.connect(lambda: show_patch_notes(dlg))
+        top.addWidget(notes_btn)
+        top.addStretch()
+        top.addWidget(QLabel(tr("언어")))
+        self.lang_combo = QComboBox()
+        self.lang_combo.addItem(tr("시스템 언어"), "auto")
+        for code, name in i18n.LANGUAGES.items():
+            self.lang_combo.addItem(name, code)
+        self.lang_combo.setCurrentIndex(
+            max(0, self.lang_combo.findData(self.settings.get("language"))))
+        self.lang_combo.currentIndexChanged.connect(self._on_language_selected)
+        top.addWidget(self.lang_combo)
+        lay.addLayout(top)
 
         lay.addWidget(self._build_variables_box())
 
-        match_box = QGroupBox("매칭 동작")
+        match_box = QGroupBox(tr("매칭 동작"))
         mb = QVBoxLayout(match_box)
         mb.setSpacing(8)
         mb.addWidget(self.normalize_chk)
         mb.addWidget(self.case_chk)
         lay.addWidget(match_box)
 
-        sys_box = QGroupBox("알림 · 시작")
+        sys_box = QGroupBox(tr("알림 · 시작"))
         sb = QVBoxLayout(sys_box)
         sb.setSpacing(8)
         sb.addWidget(self.notify_chk)
         sb.addWidget(self.startup_chk)
         lay.addWidget(sys_box)
 
-        diag_box = QGroupBox("진단")
+        diag_box = QGroupBox(tr("진단"))
         db = QVBoxLayout(diag_box)
         db.setSpacing(8)
         db.addWidget(self.debug_chk)
@@ -2978,13 +3444,13 @@ class MainWindow(QMainWindow):
     # ── 재사용 변수 관리 UI ──────────────────────────────────────
     def _build_variables_box(self) -> QGroupBox:
         """설정 창의 '변수 관리' 그룹박스(이름·값 테이블 + 추가/편집/삭제)."""
-        box = QGroupBox("변수 관리  (출력에서 {이름} 으로 재사용)")
+        box = QGroupBox(tr("변수 관리  (출력에서 {이름} 으로 재사용)"))
         v = QVBoxLayout(box)
         v.setSpacing(8)
 
         self.var_table = QTableWidget()
         self.var_table.setColumnCount(2)
-        self.var_table.setHorizontalHeaderLabels(["이름", "값"])
+        self.var_table.setHorizontalHeaderLabels([tr("이름"), tr("값")])
         self.var_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents)
         self.var_table.horizontalHeader().setSectionResizeMode(
@@ -3003,15 +3469,15 @@ class MainWindow(QMainWindow):
 
         row = QHBoxLayout()
         row.setSpacing(6)
-        add_btn = QPushButton("+ 변수 추가")
+        add_btn = QPushButton(tr("+ 변수 추가"))
         add_btn.clicked.connect(self._add_variable)
-        edit_btn = QPushButton("편집")
+        edit_btn = QPushButton(tr("편집"))
         edit_btn.setObjectName("secondary")
         edit_btn.clicked.connect(self._edit_variable)
-        del_btn = QPushButton("삭제")
+        del_btn = QPushButton(tr("삭제"))
         del_btn.setObjectName("danger")
         del_btn.clicked.connect(self._delete_variable)
-        help_btn = QPushButton("? 문법 도움말")
+        help_btn = QPushButton(tr("? 문법 도움말"))
         help_btn.setObjectName("secondary")
         help_btn.clicked.connect(
             lambda: show_placeholder_help(self._settings_dialog or self,
@@ -3058,7 +3524,7 @@ class MainWindow(QMainWindow):
         name = self._selected_variable_name()
         if name is None:
             QMessageBox.information(
-                self._settings_dialog or self, "알림", "편집할 변수를 선택하세요.")
+                self._settings_dialog or self, tr("알림"), tr("편집할 변수를 선택하세요."))
             return
         dlg = VariableDialog(
             self._settings_dialog or self, name=name,
@@ -3075,11 +3541,11 @@ class MainWindow(QMainWindow):
         name = self._selected_variable_name()
         if name is None:
             QMessageBox.information(
-                self._settings_dialog or self, "알림", "삭제할 변수를 선택하세요.")
+                self._settings_dialog or self, tr("알림"), tr("삭제할 변수를 선택하세요."))
             return
         reply = QMessageBox.question(
-            self._settings_dialog or self, "삭제 확인",
-            f"'{name}' 변수를 삭제할까요?")
+            self._settings_dialog or self, tr("삭제 확인"),
+            tr("'{name}' 변수를 삭제할까요?", name=name))
         if reply == QMessageBox.StandardButton.Yes:
             self.variables.pop(name, None)
             self._on_variables_changed()
@@ -3089,7 +3555,7 @@ class MainWindow(QMainWindow):
         save_variables(self.variables)
         self.listener.set_variables(self.variables)
         self._refresh_variables_table()
-        self.status_label.setText(f"변수 {len(self.variables)}개 저장됨")
+        self.status_label.setText(tr("변수 {n}개 저장됨", n=len(self.variables)))
 
     def _open_settings(self):
         if self._settings_dialog is None:
@@ -3103,12 +3569,12 @@ class MainWindow(QMainWindow):
     def _build_group_panel(self) -> QWidget:
         """왼쪽 그룹 패널: 클릭하면 그 그룹만 보기, 체크박스로 그룹 켜기/끄기."""
         panel = QWidget()
-        panel.setFixedWidth(190)
+        panel.setFixedWidth(210)
         v = QVBoxLayout(panel)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(6)
 
-        title = QLabel("키워드 그룹")
+        title = QLabel(tr("키워드 그룹"))
         title.setStyleSheet("color:#9370DB; font-weight:700; font-size:12px;")
         v.addWidget(title)
 
@@ -3119,9 +3585,9 @@ class MainWindow(QMainWindow):
             "QListWidget::item { padding:6px 6px; border-radius:5px; }"
             "QListWidget::item:selected { background:#2A2050; color:#fff; }")
         self.group_list.setToolTip(
-            "클릭: 해당 그룹의 키워드만 보기\n"
+            tr("클릭: 해당 그룹의 키워드만 보기\n"
             "체크 해제: 그 그룹의 키워드를 모두 끄기(목록에는 남음)\n"
-            "더블클릭/우클릭: 이름 변경·삭제")
+            "더블클릭/우클릭: 이름 변경·삭제"))
         self.group_list.itemChanged.connect(self._on_group_item_changed)
         self.group_list.currentRowChanged.connect(self._on_group_selected)
         self.group_list.itemDoubleClicked.connect(
@@ -3133,16 +3599,16 @@ class MainWindow(QMainWindow):
 
         row = QHBoxLayout()
         row.setSpacing(4)
-        add_g = QPushButton("+ 그룹")
-        add_g.setToolTip("새 키워드 그룹을 만듭니다")
+        add_g = QPushButton(tr("+ 그룹"))
+        add_g.setToolTip(tr("새 키워드 그룹을 만듭니다"))
         add_g.clicked.connect(self._add_group)
-        ren_g = QPushButton("이름")
+        ren_g = QPushButton(tr("이름 바꾸기"))
         ren_g.setObjectName("secondary")
-        ren_g.setToolTip("선택한 그룹 이름 변경")
+        ren_g.setToolTip(tr("선택한 그룹 이름 변경"))
         ren_g.clicked.connect(self._rename_group)
-        del_g = QPushButton("삭제")
+        del_g = QPushButton(tr("삭제"))
         del_g.setObjectName("danger")
-        del_g.setToolTip("선택한 그룹 삭제(키워드는 미분류로 이동)")
+        del_g.setToolTip(tr("선택한 그룹 삭제(키워드는 미분류로 이동)"))
         del_g.clicked.connect(self._delete_group)
         for b in (add_g, ren_g, del_g):
             b.setStyleSheet("padding:6px 8px;")
@@ -3165,7 +3631,7 @@ class MainWindow(QMainWindow):
         lst.blockSignals(True)
         lst.clear()
         self._group_rows = [None]
-        all_item = QListWidgetItem(f"전체  ({len(self.rules)})")
+        all_item = QListWidgetItem(f"{tr('전체')}  ({len(self.rules)})")
         all_font = QFont("Segoe UI")
         all_font.setBold(True)
         all_item.setFont(all_font)
@@ -3174,7 +3640,7 @@ class MainWindow(QMainWindow):
         if counts.get("", 0) or not names:
             names.append("")  # 미분류는 키워드가 있을 때만(그룹이 없으면 항상)
         for g in names:
-            label = g if g else UNGROUPED_LABEL
+            label = g if g else ungrouped_label()
             item = QListWidgetItem(f"{label}  ({counts.get(g, 0)})")
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             on = g not in self.disabled_groups
@@ -3182,7 +3648,7 @@ class MainWindow(QMainWindow):
                                else Qt.CheckState.Unchecked)
             if not on:
                 item.setForeground(QColor("#666"))
-                item.setToolTip("꺼짐 — 이 그룹의 키워드는 동작하지 않습니다")
+                item.setToolTip(tr("꺼짐 — 이 그룹의 키워드는 동작하지 않습니다"))
             lst.addItem(item)
             self._group_rows.append(g)
         if self.group_filter not in self._group_rows:
@@ -3227,9 +3693,10 @@ class MainWindow(QMainWindow):
         self._save_group_settings()
         # 리스너에는 즉시 반영(타이머를 기다리지 않음)
         self.listener.set_rules(self._effective_rules())
-        label = g if g else UNGROUPED_LABEL
+        label = g if g else ungrouped_label()
         self.status_label.setText(
-            f"그룹 '{label}' " + ("켜짐" if on else "꺼짐 (키워드 동작 안 함)"))
+            tr("그룹 '{name}' 켜짐", name=label) if on else
+            tr("그룹 '{name}' 꺼짐 (키워드 동작 안 함)", name=label))
         # 체크 변경 시그널 안에서 목록을 다시 그리면 불안정하므로 다음 틱에.
         QTimer.singleShot(0, self._refresh_table)
 
@@ -3238,42 +3705,42 @@ class MainWindow(QMainWindow):
         if item is not None:
             self.group_list.setCurrentItem(item)
         menu = QMenu(self)
-        menu.addAction("+ 새 그룹").triggered.connect(self._add_group)
+        menu.addAction(tr("+ 새 그룹")).triggered.connect(self._add_group)
         if self._selected_group():
-            menu.addAction("이름 변경").triggered.connect(self._rename_group)
-            menu.addAction("삭제").triggered.connect(self._delete_group)
+            menu.addAction(tr("이름 변경")).triggered.connect(self._rename_group)
+            menu.addAction(tr("삭제")).triggered.connect(self._delete_group)
         menu.exec(self.group_list.mapToGlobal(pos))
 
     def _ask_group_name(self, title, text="", existing=()):
         while True:
-            name, ok = QInputDialog.getText(self, title, "그룹 이름:", text=text)
+            name, ok = QInputDialog.getText(self, title, tr("그룹 이름:"), text=text)
             if not ok:
                 return None
             name = name.strip()
             err = validate_group_name(name, existing)
             if not err:
                 return name
-            QMessageBox.warning(self, "그룹 이름", err)
+            QMessageBox.warning(self, tr("그룹 이름"), err)
             text = name
 
     def _add_group(self):
-        name = self._ask_group_name("그룹 추가", existing=self.group_order)
+        name = self._ask_group_name(tr("그룹 추가"), existing=self.group_order)
         if not name:
             return None
         self.group_order = self.group_order + [name]
         self._save_group_settings()
         self.group_filter = name
         self._refresh_table()
-        self.status_label.setText(f"그룹 '{name}' 추가됨")
+        self.status_label.setText(tr("그룹 '{name}' 추가됨", name=name))
         return name
 
     def _rename_group(self):
         old = self._selected_group()
         if not old:
-            QMessageBox.information(self, "알림", "이름을 바꿀 그룹을 선택하세요.")
+            QMessageBox.information(self, tr("알림"), tr("이름을 바꿀 그룹을 선택하세요."))
             return
         others = [g for g in self.group_order if g != old]
-        new = self._ask_group_name("그룹 이름 변경", text=old, existing=others)
+        new = self._ask_group_name(tr("그룹 이름 변경"), text=old, existing=others)
         if not new or new == old:
             return
         for r in self.rules:
@@ -3287,19 +3754,19 @@ class MainWindow(QMainWindow):
         save_rules(self.rules)
         self._save_group_settings()
         self._refresh_table()
-        self.status_label.setText(f"그룹 이름 변경: '{old}' → '{new}'")
+        self.status_label.setText(tr("그룹 이름 변경: '{old}' → '{new}'", old=old, new=new))
 
     def _delete_group(self):
         g = self._selected_group()
         if not g:
-            QMessageBox.information(self, "알림", "삭제할 그룹을 선택하세요.")
+            QMessageBox.information(self, tr("알림"), tr("삭제할 그룹을 선택하세요."))
             return
         n = self._group_counts().get(g, 0)
-        msg = f"'{g}' 그룹을 삭제할까요?"
+        msg = tr("'{name}' 그룹을 삭제할까요?", name=g)
         if n:
-            msg += (f"\n\n이 그룹의 키워드 {n}개는 삭제되지 않고 "
-                    f"'{UNGROUPED_LABEL}'로 이동합니다.")
-        if QMessageBox.question(self, "그룹 삭제", msg) != QMessageBox.StandardButton.Yes:
+            msg += tr("\n\n이 그룹의 키워드 {n}개는 삭제되지 않고 '{label}'로 이동합니다.",
+                      n=n, label=ungrouped_label())
+        if QMessageBox.question(self, tr("그룹 삭제"), msg) != QMessageBox.StandardButton.Yes:
             return
         for r in self.rules:
             if rule_group(r) == g:
@@ -3310,7 +3777,7 @@ class MainWindow(QMainWindow):
         save_rules(self.rules)
         self._save_group_settings()
         self._refresh_table()
-        self.status_label.setText(f"그룹 '{g}' 삭제됨")
+        self.status_label.setText(tr("그룹 '{name}' 삭제됨", name=g))
 
     def _move_rule_to_group(self, idx, group):
         if group is None:  # "새 그룹…"
@@ -3322,8 +3789,9 @@ class MainWindow(QMainWindow):
             save_rules(self.rules)
             self._refresh_table()
             self.status_label.setText(
-                f'"{self.rules[idx]["trigger"]}" → 그룹 '
-                f"'{group or UNGROUPED_LABEL}'")
+                tr("\"{trigger}\" → 그룹 '{name}'",
+                   trigger=self.rules[idx]["trigger"],
+                   name=group or ungrouped_label()))
 
     def _show_rule_menu(self, pos):
         row = self.table.rowAt(pos.y())
@@ -3334,20 +3802,20 @@ class MainWindow(QMainWindow):
         if idx is None:
             return
         menu = QMenu(self)
-        menu.addAction("편집").triggered.connect(self._edit_rule)
-        move = menu.addMenu("그룹 이동")
+        menu.addAction(tr("편집")).triggered.connect(self._edit_rule)
+        move = menu.addMenu(tr("그룹 이동"))
         cur = rule_group(self.rules[idx])
         for g in [""] + list(self.group_order):
-            act = move.addAction(g if g else UNGROUPED_LABEL)
+            act = move.addAction(g if g else ungrouped_label())
             act.setCheckable(True)
             act.setChecked(g == cur)
             act.triggered.connect(
                 lambda _=False, i=idx, gg=g: self._move_rule_to_group(i, gg))
         move.addSeparator()
-        move.addAction("새 그룹…").triggered.connect(
+        move.addAction(tr("새 그룹…")).triggered.connect(
             lambda _=False, i=idx: self._move_rule_to_group(i, None))
         menu.addSeparator()
-        menu.addAction("삭제").triggered.connect(self._delete_rule)
+        menu.addAction(tr("삭제")).triggered.connect(self._delete_rule)
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     # ── 테이블 갱신 ──────────────────────────────────────────────
@@ -3408,8 +3876,8 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, 4, QTableWidgetItem(rule["output"]))
             if group_off:
                 # 꺼진 그룹의 키워드는 흐리게 표시(동작하지 않음을 알림)
-                tip = (f"그룹 '{g or UNGROUPED_LABEL}' 이(가) 꺼져 있어 "
-                       "동작하지 않습니다")
+                tip = tr("그룹 '{name}' 이(가) 꺼져 있어 동작하지 않습니다",
+                         name=g or ungrouped_label())
                 for c in (2, 3, 4):
                     it = self.table.item(row, c)
                     it.setForeground(QColor("#555"))
@@ -3485,7 +3953,7 @@ class MainWindow(QMainWindow):
     def _edit_rule(self):
         idx = self._rule_index_at(self.table.currentRow())
         if idx is None:
-            QMessageBox.information(self, "알림", "편집할 규칙을 선택하세요.")
+            QMessageBox.information(self, tr("알림"), tr("편집할 규칙을 선택하세요."))
             return
         dlg = RuleDialog(self, self.rules[idx], variables=self.variables,
                          groups=self.group_order)
@@ -3500,10 +3968,10 @@ class MainWindow(QMainWindow):
     def _delete_rule(self):
         idx = self._rule_index_at(self.table.currentRow())
         if idx is None:
-            QMessageBox.information(self, "알림", "삭제할 규칙을 선택하세요.")
+            QMessageBox.information(self, tr("알림"), tr("삭제할 규칙을 선택하세요."))
             return
         trigger = self.rules[idx]["trigger"]
-        reply = QMessageBox.question(self, "삭제 확인", f'"{trigger}" 규칙을 삭제할까요?')
+        reply = QMessageBox.question(self, tr("삭제 확인"), tr("\"{trigger}\" 규칙을 삭제할까요?", trigger=trigger))
         if reply == QMessageBox.StandardButton.Yes:
             self.rules.pop(idx)
             save_rules(self.rules)
@@ -3521,22 +3989,22 @@ class MainWindow(QMainWindow):
         default_name = datetime.datetime.now().strftime(
             "KeyFlux_rules_%Y%m%d_%H%M%S.json")
         path, _ = QFileDialog.getSaveFileName(
-            self, "규칙 내보내기", default_name,
-            "JSON 파일 (*.json)"
+            self, tr("규칙 내보내기"), default_name,
+            tr("JSON 파일 (*.json)")
         )
         if not path:
             return
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self.rules, f, ensure_ascii=False, indent=2)
-            QMessageBox.information(self, "완료", f"규칙을 저장했습니다.\n{path}")
+            QMessageBox.information(self, tr("완료"), tr("규칙을 저장했습니다.\n{path}", path=path))
         except Exception as e:
-            QMessageBox.critical(self, "오류", f"저장 실패: {e}")
+            QMessageBox.critical(self, tr("오류"), tr("저장 실패: {error}", error=e))
 
     def _import_rules(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "규칙 불러오기", "",
-            "JSON 파일 (*.json)"
+            self, tr("규칙 불러오기"), "",
+            tr("JSON 파일 (*.json)")
         )
         if not path:
             return
@@ -3545,14 +4013,14 @@ class MainWindow(QMainWindow):
                 loaded = json.load(f)
             # 기본 유효성 검사
             if not isinstance(loaded, list):
-                raise ValueError("규칙 목록이 배열 형식이 아닙니다.")
+                raise ValueError(tr("규칙 목록이 배열 형식이 아닙니다."))
             for r in loaded:
                 if not all(k in r for k in ("type", "trigger", "output")):
-                    raise ValueError(f"잘못된 규칙 항목: {r}")
+                    raise ValueError(tr("잘못된 규칙 항목: {rule}", rule=r))
 
             reply = QMessageBox.question(
-                self, "불러오기 방식",
-                "기존 규칙을 대체할까요?\n\n[Yes] 대체   [No] 기존에 추가",
+                self, tr("불러오기 방식"),
+                tr("기존 규칙을 대체할까요?\n\n[예] 대체   [아니요] 기존에 추가"),
                 QMessageBox.StandardButton.Yes |
                 QMessageBox.StandardButton.No  |
                 QMessageBox.StandardButton.Cancel
@@ -3562,7 +4030,7 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.StandardButton.Yes:
                 self.rules = loaded
                 QMessageBox.information(
-                    self, "완료", f"{len(loaded)}개 규칙을 불러왔습니다 (대체).")
+                    self, tr("완료"), tr("{n}개 규칙을 불러왔습니다 (대체).", n=len(loaded)))
             else:
                 # 중복 트리거 스킵
                 existing = {r["trigger"] for r in self.rules}
@@ -3572,25 +4040,27 @@ class MainWindow(QMainWindow):
                         self.rules.append(r)
                         existing.add(r["trigger"])
                         added += 1
-                QMessageBox.information(self, "완료", f"{added}개 규칙을 추가했습니다.")
+                QMessageBox.information(self, tr("완료"), tr("{n}개 규칙을 추가했습니다.", n=added))
 
             save_rules(self.rules)
             self._refresh_table()
         except Exception as e:
-            QMessageBox.critical(self, "오류", f"불러오기 실패: {e}")
+            QMessageBox.critical(self, tr("오류"), tr("불러오기 실패: {error}", error=e))
 
     # ── 전체 활성/비활성 ─────────────────────────────────────────
     def _toggle_active(self):
-        is_active = self.listener.active
-        self.listener.set_active(not is_active)
-        if not is_active:
-            self.toggle_btn.setText("● 활성화됨")
+        self.listener.set_active(not self.listener.active)
+        self._show_active_state()
+
+    def _show_active_state(self):
+        if self.listener.active:
+            self.toggle_btn.setText(tr("● 활성화됨"))
             self.toggle_btn.setObjectName("toggle_on")
-            self.status_label.setText("대기 중...")
+            self.status_label.setText(tr("대기 중..."))
         else:
-            self.toggle_btn.setText("○ 비활성화됨")
+            self.toggle_btn.setText(tr("○ 비활성화됨"))
             self.toggle_btn.setObjectName("toggle_off")
-            self.status_label.setText("변환 중지됨")
+            self.status_label.setText(tr("변환 중지됨"))
         self.toggle_btn.style().unpolish(self.toggle_btn)
         self.toggle_btn.style().polish(self.toggle_btn)
 
@@ -3601,7 +4071,8 @@ class MainWindow(QMainWindow):
         save_settings(self.settings)
         self.listener.set_normalize_mode(val)
         self.status_label.setText(
-            "한/영·대소문자 무관 매칭 " + ("켜짐" if val else "꺼짐"))
+            tr("한/영·대소문자 무관 매칭 켜짐") if val
+            else tr("한/영·대소문자 무관 매칭 꺼짐"))
 
     # ── 결과 대소문자 보장 토글 ──────────────────────────────────
     def _toggle_case_guarantee(self, state):
@@ -3610,14 +4081,14 @@ class MainWindow(QMainWindow):
         save_settings(self.settings)
         self.listener.set_case_guarantee(val)
         self.status_label.setText(
-            "결과 대소문자 보장 " + ("켜짐" if val else "꺼짐"))
+            tr("결과 대소문자 보장 켜짐") if val else tr("결과 대소문자 보장 꺼짐"))
 
     # ── 윈도우 알림 표시 토글 ────────────────────────────────────
     def _toggle_notifications(self, state):
         val = bool(state)
         self.settings["notifications_enabled"] = val
         save_settings(self.settings)
-        self.status_label.setText("윈도우 알림 " + ("켜짐" if val else "꺼짐"))
+        self.status_label.setText(tr("윈도우 알림 켜짐") if val else tr("윈도우 알림 꺼짐"))
 
     def _notify(self, title, msg, icon=QSystemTrayIcon.MessageIcon.NoIcon,
                 ms=1500):
@@ -3633,9 +4104,9 @@ class MainWindow(QMainWindow):
         set_debug(val)
         if val:
             dbg("==== debug logging enabled ====")
-            self.status_label.setText(f"디버그 로그 기록: {DEBUG_LOG_FILE}")
+            self.status_label.setText(tr("디버그 로그 기록: {path}", path=DEBUG_LOG_FILE))
         else:
-            self.status_label.setText("디버그 로그 꺼짐")
+            self.status_label.setText(tr("디버그 로그 꺼짐"))
 
     # ── 시작 시 자동 실행 토글 ───────────────────────────────────
     def _toggle_startup(self, state):
@@ -3651,14 +4122,14 @@ class MainWindow(QMainWindow):
             if val and state_now.get("kind") == "run":
                 # 작업 스케줄러가 막혀 레지스트리로 폴백한 경우 — 이때는
                 # 관리자 권한 없이 뜨므로 사용자에게 알려 준다.
-                how = " (제한 모드: 작업 스케줄러 등록 실패 → 레지스트리 등록)"
+                how = tr(" (제한 모드: 작업 스케줄러 등록 실패 → 레지스트리 등록)")
             self.status_label.setText(
-                "시작 시 자동 실행 " + ("등록됨" if val else "해제됨") + how)
+                (tr("시작 시 자동 실행 등록됨") if val else tr("시작 시 자동 실행 해제됨")) + how)
         else:
             # 실패 시 체크 상태를 실제 등록 상태로 되돌리고, 원인을 보여준다.
             why = startup_last_error()
             self.status_label.setText(
-                "시작 프로그램 설정에 실패했습니다." + (f" — {why}" if why else ""))
+                tr("시작 프로그램 설정에 실패했습니다.") + (f" — {why}" if why else ""))
             self.startup_chk.blockSignals(True)
             self.startup_chk.setChecked(is_startup_enabled())
             self.startup_chk.blockSignals(False)
@@ -3677,17 +4148,23 @@ class MainWindow(QMainWindow):
     # ── 트레이 아이콘 ────────────────────────────────────────────
     def _build_tray(self):
         self.tray = QSystemTrayIcon(make_app_icon(), self)
-        menu = QMenu()
-        menu.addAction("열기").triggered.connect(self.show)
-        menu.addAction("활성화 토글").triggered.connect(self._toggle_active)
-        menu.addSeparator()
-        menu.addAction("종료").triggered.connect(QApplication.quit)
-        self.tray.setContextMenu(menu)
+        self._tray_menu = QMenu()
+        self.tray.setContextMenu(self._tray_menu)
         self.tray.activated.connect(
             lambda r: self.show() if r == QSystemTrayIcon.ActivationReason.DoubleClick else None
         )
+        self._fill_tray()
         self.tray.show()
-        self.tray.setToolTip(f"KeyFlux v{APP_VERSION} - 실행 중")
+
+    def _fill_tray(self):
+        menu = self._tray_menu
+        menu.clear()
+        menu.addAction(tr("열기")).triggered.connect(self.show)
+        menu.addAction(tr("활성화 토글")).triggered.connect(self._toggle_active)
+        menu.addAction(tr("패치 내역")).triggered.connect(lambda: show_patch_notes(self))
+        menu.addSeparator()
+        menu.addAction(tr("종료")).triggered.connect(QApplication.quit)
+        self.tray.setToolTip(tr("KeyFlux v{version} - 실행 중", version=APP_VERSION))
 
     # ── 리스너 생성/시작 ─────────────────────────────────────────
     def _init_listener(self):
@@ -3705,19 +4182,20 @@ class MainWindow(QMainWindow):
         self.listener.start()
 
     def _on_status(self, msg):
-        self.status_label.setText(f"변환됨: {msg}")
+        self.status_label.setText(tr("변환됨: {msg}", msg=msg))
         self._notify("KeyFlux", msg, QSystemTrayIcon.MessageIcon.NoIcon, 1500)
 
     def closeEvent(self, event):
         event.ignore()
         self.hide()
-        self._notify("KeyFlux", "트레이에서 계속 실행 중입니다.",
+        self._notify("KeyFlux", tr("트레이에서 계속 실행 중입니다."),
                      QSystemTrayIcon.MessageIcon.Information, 2000)
 
 
 # ── 진입점 ───────────────────────────────────────────────────────
 def main():
     app = QApplication(sys.argv)
+    apply_language(load_settings().get("language"))
 
     # Windows 작업표시줄이 우리 창을 별도 앱으로 묶고 지정 아이콘을 쓰도록
     # AppUserModelID 를 명시한다(없으면 python.exe 의 기본 아이콘이 뜸).
@@ -3747,7 +4225,7 @@ def main():
         msg = QMessageBox()
         msg.setWindowTitle("KeyFlux")
         msg.setIcon(QMessageBox.Icon.Warning)
-        msg.setText("프로그램이 이미 실행 중입니다.\n트레이 아이콘을 확인하세요.")
+        msg.setText(tr("프로그램이 이미 실행 중입니다.\n트레이 아이콘을 확인하세요."))
         msg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         msg.show()
         msg.raise_()
@@ -3798,7 +4276,7 @@ def main():
     try:
         sys.exit(app.exec())
     except KeyboardInterrupt:
-        print("\nKeyFlux 종료됨 (Ctrl+C)")
+        print(tr("\nKeyFlux 종료됨 (Ctrl+C)"))
         sys.exit(0)
 
 if __name__ == "__main__":
